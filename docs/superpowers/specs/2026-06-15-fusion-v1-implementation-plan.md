@@ -1,86 +1,134 @@
-# `/fusion` v1 — план реализации (консенсус 3 моделей)
+# `/fusion` v1.1 — план реализации (после ревью плана 3 моделями)
 
 - **Дата:** 2026-06-15
 - **Источник:** спека v2 (`2026-06-15-fusion-plan-engine-design.md`)
-- **Синтез:** независимые драфты Claude + Codex (gpt-5.5) + DeepSeek V4 Pro → консенсус. Синтезатор — Claude (конфликт участник/синтезатор известен; смягчён тем, что единственное реальное расхождение — число раундов — резолвлено **против** Claude-драфта).
-- **Статус:** ждёт Phase 0 (re-spike + baseline-A/B = go/no-go) перед сборкой пайплайна.
+- **Синтез:** независимые драфты Claude + Codex (gpt-5.5) + DeepSeek V4 Pro → консенсус → ревью плана теми же тремя → v1.1.
+- **Статус:** буилдабельный после Phase 0 (транспорт 0.1 уже эмпирически прогнан в сессии 2026-06-15).
 
-## Резолв расхождений
+## Что изменилось v1 → v1.1 (закрытые блокеры ревью)
 
-| Вопрос | Claude | V4 Pro | Codex | Консенсус |
-|---|---|---|---|---|
-| Раундов в v1 | 1 | 2 (1 раунд = не fusion, а parallel-review) | 2 | **2** (без re-discuss модели не видят критику друг друга → нет дебата) |
-| Бюджет | hard cap раундов | ручной (оператор видит cost/раунд) | авто-cap + fallback improve | **ручная видимость + hard cap; авто — v2** |
-| Отказ модели | выбывает | выбывает | **retry 1× меньшим промптом**, потом выбывает | **retry once, потом degraded** |
-| Layout артефактов | `.fusion/` | `.fusion/run-<ts>/` | `runs/<ts>/{brief,drafts,cross,rediscuss,spikes,final}/+status.json` | **codex-layout** |
+Тройное единогласие ревью: ядро механизма было не определено, а cut-list срезал несущее. Закрыто:
 
-## v1 scope (мульти-угол, тройной консенсус)
+1. Определены **status.json-схема**, **consensus-рубрика**, **synthesis-шаблон** (ниже) — иначе `collect`/consensus неисполнимы над free-form markdown.
+2. Возвращены в v1: **cleanup-trap**, **drift-check между раундами**, **минимальный spike-контракт**.
+3. **Claude-step** получает тот же adapter-контракт, что внешние модели.
+4. Baseline-A/B переформулирован из «гейт за час» в **eval-день** с рубрикой и анонимизацией; идиот-тест — на **canary-планах с seeded-дефектами**.
+5. Разрешено **3 vs 2 семейства**: full fusion = 3; 2 = явный `degraded: two-model` с отдельной таблицей консенсуса.
 
-**Строим:** фиксированный 2-раундный цикл, 3 семейства, `fusion.sh` (тупая труба) + `SKILL.md` (playbook). Минимальная комплектация, при которой тезис «ансамбль > топ-модель» вообще проверяем.
+## Ядро механизма (то, без чего не строится)
 
-**НЕ строим в v1 (все трое):** адаптивную глубину · авто-budget-гейт · OpenRouter-фолбэк · формальный спайк-контракт · авто-cleanup-trap · drift-check enforcement · benchmark-suite · БД · UI · полировку plugin-манифеста · hosted `openrouter/fusion` · авто-исполнение кода · отдельную модель-судью · неограниченные раунды.
+### status.json (схема v1)
 
-## Phase 0 — Re-spike перед сборкой (go/no-go)
+```json
+{
+  "run_id": "<ts>", "task": "<...>", "round": 1, "head": "<git-sha-на-момент-брифа>",
+  "participants": {
+    "claude":   {"status": "ok|timeout|error|quota|degraded", "draft": "<path>", "tokens": 0, "cost": "0|unknown", "retries": 0},
+    "codex":    {"...": "..."},
+    "deepseek": {"...": "..."}
+  },
+  "cross_verify": [{"verifier":"claude","target":"codex","findings":"<path>","blockers":0}],
+  "disagreements": [{"axis":"architecture","parties":["codex"],"severity":"critical|major|minor","instrumental_proof":"<path>|null"}],
+  "consensus": {"architecture":"reached|split","approach":"...","effort":"...","risk":"...","assumptions":"..."},
+  "decision": "consensus|operator-interview|degraded",
+  "degraded": "none|two-model|claude-only"
+}
+```
 
-Закрыть 3 риска ДО кода:
+`cost` = реальная цифра per-adapter ИЛИ `"unknown"` — никаких синтетических чисел.
 
-- **0.1 Транспорт.** Прогнать неинтерактивно: `claude` (субагент или `--print` — **проверить существование флага**), `codex exec --sandbox read-only`, `opencode run --dir <repo> --pure -m opencode-go/deepseek-v4-pro`. Замерить: latency, токены/стоимость, остаток codex-квоты, поведение на таймауте, **протекают ли write-тулы при `--pure`** (живой факт: V4 Pro записал файл при `--pure`), реально ли 1M-контекст V4 (отправить ~300K, проверить ссылки на конец промпта). Гейт: ≥2 семейств надёжны.
-- **0.2 Baseline-A/B (go/no-go всего проекта).** 3–5 реальных задач × {Claude-only, improve, fusion-вручную}. Слепая оценка оператором: «готов выполнять — да/нет» + ранг. Везде хуже Claude-only → **стоп, не строим**.
-- **0.3 Идиот-тест.** Дать модели чужой план в роли кросс-верификатора «автор некомпетентен, проверь инструментально». Успех: ≥1 reasoning-ошибка найдена через grep/read, а не «перечитал и согласился». Только `file:line` → главный архитектурный риск не закрыт.
-- **0.4 Стоимость** 2-раундного прогона из данных 0.1.
+### consensus-рубрика
+
+- **Оси:** architecture · approach · effort · risk · key-assumptions.
+- **Состояние оси:** `reached` (все доступные согласны) / `split`.
+- **Severity спора:** `critical` (меняет выбранное решение / необратимость / корректность) · `major` · `minor`.
+- **Правила:**
+  - Любой **critical split**, доживший до конца R2 → **интервью оператора**. Большинство 2/3 НЕ перебивает critical-minority, у которой есть `instrumental_proof`.
+  - `major split` → синтез отмечает оба + склоняется к большинству, фиксирует возражение.
+  - `minor split` → механический мёрж синтезатора.
+  - Спор с `instrumental_proof` (cross-verify-находка с evidence-файлом) старше спора без пруфа.
+
+### synthesis-шаблон (механический fill-in, не творчество Claude)
+
+Фиксированные секции, каждая заполняется из сырых артефактов по правилу:
+
+| Секция | Источник |
+|---|---|
+| Problem | task + бриф |
+| Constraints | объединение constraints всех драфтов, дедуп |
+| Chosen solution | подход с `consensus.architecture=reached`; если `blocked` → решение оператора |
+| Alternatives + why-rejected | проигравшие драфты + их cross-verify |
+| Implementation steps | консенсусные шаги |
+| Assumptions (ranked) | из драфтов; confidence = (согласие моделей) × (instrumental-backing) → HIGH/MED/LOW |
+| Operator-unknowns | явный список с «почему не определили» |
+| Hard boundaries / STOP | из драфтов |
+| Git stamp + drift status | HEAD + результат drift-check |
+
+## Phase 0 — префлайт
+
+- **0.1 Транспорт — ПРОГНАН (2026-06-15).** ~10 успешных неинтерактивных вызовов codex `exec` + opencode V4 Pro в этой сессии. Открытые факты к до-замеру: `claude --print` существование, протечка write при `--pure` (V4 Pro записал файл — подтверждено), реальный 1M V4 на 300K-промпте. Гейт: ≥2 семейств надёжны → ок (codex+V4+Claude доступны).
+- **0.2 Baseline-A/B — это EVAL-ДЕНЬ, не гейт за час.** Frozen-набор 8 задач × {Claude-only, improve, fusion}. Бинарная рубрика на план: `executable-as-is` / `has-errors` / `useful-insight`. Анонимизация: вывод перемешан, авторство срезано. **Pass:** fusion ≥ Claude-only на большинстве И строго лучше на ≥2. Иначе — не строим full.
+- **0.3 Идиот-тест — на canary.** Планы с **seeded-дефектами** (известные reasoning-ошибки). Метрика: catch-rate дефектов + false-block-rate (штраф за ложные блокеры). Только `file:line`-находки без reasoning → архитектура под вопросом.
 
 ## Phase 1 — `fusion.sh` (детерминированная труба)
 
 Layout: `runs/<ts>/{brief.md, drafts/, cross/, rediscuss/, spikes/, final/, status.json}`.
 
 Команды:
-- `cleanup --all` — снос сирот-worktree + `runs/tmp-*` (ручной вызов на старте; авто — v2).
-- `fan <codex|deepseek> <role:draft|rediscuss> <promptfile>` — неинтерактивный вызов, таймаут 300s, **retry 1× меньшим промптом**, результат в `runs/<ts>/<role>/<model>.md`, статус в `status.json`.
-- `cross-verify <model> --target <draft-file>` — идиот-тест-промпт + план → вывод в `cross/`.
-- `spike "<hypothesis>"` — throwaway `git worktree` + `opencode run --pure`, ad-hoc (формальный контракт — v2).
-- `collect <run-dir>` — склейка артефактов + `status.json` в `aggregate.md`.
+- `cleanup [--all]` — снос сирот-worktree + `runs/tmp-*`. **Вызывается на старте КАЖДОГО run + `trap`/finally на выходе** (не только ручная).
+- `fan <model> <role:draft|rediscuss> <promptfile>` — неинтерактивный вызов, таймаут 300s, **retry по детерминированным tiers** (tier1 full → tier2 без полных чужих планов (саммари) → tier3 truncated бриф, task+свой план), запись в `runs/<ts>/<role>/<model>.md`, обновление `status.json`. Валидирует, что stdout содержит мин. структуру (заголовок) — иначе `error`.
+- `cross-verify <verifier-model> --target <draft>` — идиот-тест-шаблон + план → `cross/`.
+- `spike <hypothesis> [--allow cmd,...] [--max-files N] [--max-time S]` — throwaway worktree, **structured verdict**: `{hypothesis, verdict: confirmed|refuted|inconclusive, evidence, blocks:[branch-id]}`. no-new-deps по умолчанию. Упал → зависимая ветка плана блок.
+- `collect <run-dir>` — склейка артефактов + `status.json` → `aggregate.md`.
 
-Exit codes: `0` ok · `1` degraded (модель недоступна) · `2` критичный отказ. **Claude — вне шелла:** SKILL.md зовёт Claude-субагента и кладёт результат в тот же layout.
+Exit: `0` ok · `1` degraded · `2` критично. **Claude — вне шелла, но с тем же контрактом:** SKILL.md зовёт Claude-субагента, кладёт draft в layout и **сам пишет его запись в `status.json`** (status/tokens/retries), как для внешних.
 
 ## Phase 2 — `SKILL.md` (оркестратор, исполняет Claude)
 
-1. Парс `/fusion <task> [--depth lite|full]`.
-2. **Сырой бриф** (структура репо, git HEAD, ADR/intent-доки, релевантные файлы grep'ом) ≤30–40% контекста участника. **Без Claude-пересказа** в промптах участников — иначе слепые зоны Claude общие.
-3. Ручная видимость бюджета: после каждого раунда Claude выводит токены/стоимость/раунды; жёсткий cap раундов.
+1. Парс `/fusion <task> --dir <target-repo> [--depth lite|full]`. **fusion работает НАД target-репо** (`--dir`), артефакты — в `<target>/.fusion/runs/`.
+2. **brief-builder (spec):** источники — repo-tree (depth-cap), git HEAD + recent log, ADR/CONTEXT/README (cap), файлы задачи (grep+glob), intent-доки. Лимит per-source + общий ≤30–40% контекста участника. Исключения: секреты, lockfiles, vendored, build-артефакты. **coverage-check:** список кандидатов vs включённых, дропнутое логируется. Сырьё, не Claude-пересказ.
+3. **drift-check:** `git rev-parse HEAD` перед каждым раундом и перед synthesize; HEAD сдвинулся → пере-снять затронутые куски брифа, отметить в status.
+4. **budget:** per-adapter токены/стоимость ИЛИ `unknown`; жёсткий cap раундов; вывод оператору после раунда.
 
-## Phase 3 — Цикл планирования (2 раунда)
+## Phase 3 — Цикл (2 раунда)
 
 ```
-R1: draft (3 независимо, ОБЯЗАН мульти-угол: не решать / проще / зависит от будущих планов / сценарии)
+R1: draft (3 независимо, ОБЯЗАН мульти-угол: не решать / проще / зависит-от-будущего / сценарии)
     → cross-verify (ротация: Claude→Codex, Codex→DeepSeek, DeepSeek→Claude)
-    → aggregate (collect → один пакет: планы + блокеры + противоречия + assumptions)
-R2: re-discuss (все видят весь пакет; явно склоняются к варианту / правят / поднимают DISAGREE)
-    → cross-verify (та же ротация на планах R2)
-    → consensus/block
-synthesize: Claude МЕХАНИЧЕСКИ собирает консенсус → *-plan.md + *-debate.md (решение от консенсуса, не Claude-вкус)
+    → collect → aggregate.md
+R2: drift-check → re-discuss (все видят пакет; склоняются/правят/DISAGREE)
+    → cross-verify (та же ротация) → collect
+consensus/block (по рубрике над status.json) → critical-split → оператор
+synthesize (шаблон fill-in) → final/<topic>-plan.md + final/<topic>-debate.md
 ```
-
-**Consensus/block:** все 3 сошлись по ключевому → консенсус. 2/3 + слабый DISAGREE → консенсус 2/3. DISAGREE с инструментальными пруфами или 3/3 врозь → **интервью оператора** (AskUserQuestion, только на реальной развилке). Конвергенция → sanity-check «почему сошлись» (реальный research или поверхностно).
-
-Формат плана: self-contained · **assumptions ranked by confidence** (вместо gates) · **operator-unknowns** · hard boundaries + STOP · git-стамп.
 
 ## Phase 4 — Отказы / degraded
 
 | Событие | Реакция |
 |---|---|
-| timeout 300s / exit≠0 / пустой stdout | retry 1× меньшим промптом → пометить `timeout/error`, продолжить |
-| codex quota | пометить `quota`, выбывание (фолбэк — v2) |
-| ровно 2 семейства | `degraded: two-model`, цикл идёт, кросс-верификация между двумя |
-| 1 семейство | `degraded: claude-only`, **не выдаётся за fusion**, план с пометкой |
-| спайк упал | допущение «не подтверждено», зависимая ветка плана — блок |
-| нет ответа оператора | становится `operator-unknown`, не выдуманная уверенность |
+| timeout/exit≠0/пустой/непарсится | retry по tiers → пометить `timeout/error`, продолжить |
+| codex quota | `quota`, выбывание (фолбэк gpt-via-OpenRouter — v2) |
+| 2 семейства | `degraded: two-model` (см. таблицу ниже) |
+| 1 семейство | `degraded: claude-only`, **не fusion**, план с пометкой |
+| spike refuted/упал | допущение «не подтверждено», зависимая ветка — блок |
+| нет ответа оператора | `operator-unknown`, не выдуманная уверенность |
+| worktree-сирота | `cleanup` на старте + trap на выходе |
 
-## Риски (тройной консенсус)
+**degraded: two-model консенсус:** cross-verify взаимная (A→B, B→A); большинства 2/3 нет → любой неразрешённый спор → оператор (не «один перебил другого»).
 
-ROI vs improve не доказан · флаги CLI дрейфуют · качество сырого брифа может перебить разнообразие моделей · конфликт Claude-синтезатора остаётся · кросс-верификация может не поймать reasoning-баг · стоимость может сделать full-режим непрактичным.
+## Cut-list v1.1 (что реально откладываем)
 
-## Спайкнуть первым (прямо сейчас)
+adaptive depth · авто-budget-fallback в improve · OpenRouter gpt-фолбэк · БД/персистентность (кроме append `status.json`-лога) · benchmark-suite · hosted `openrouter/fusion` · авто-исполнение кода вне spike · отдельная модель-судья · полировка plugin-манифеста (минимальный install/invoke — НЕ откладываем) · ротация синтезатора (v2-смягчение Claude-конфликта).
 
-1. Транспорт re-spike (0.1) — блокирует `fan`, ~30 мин.
-2. Baseline-A/B на 1 задаче (0.2) — есть ли смысл вообще, ~1 ч.
-3. Идиот-тест на 1 плане (0.3) — главный архитектурный риск, ~30 мин.
+## Остаточные риски (честно)
+
+- **Claude-синтезатор-конфликт смягчён, не устранён:** consensus теперь по рубрике над status.json, synthesis — шаблон, ambiguous-critical → оператор. Но Claude всё ещё авторит бриф и крутит рубрику. Полная нейтральность = не-Claude синтезатор (v2).
+- **Wall-clock:** ≥1 ч/задача (6×300s × 2 раунда без retry/spike). fusion — НЕ интерактивный планёр; это batch-инструмент. Признано.
+- **Качество брифа** — главный quality lever; brief-builder может стать отдельным под-проектом.
+- **ROI** доказывается только Phase 0.2 eval-днём.
+
+## Спайкнуть первым
+
+1. Транспорт-замер (latency/tokens/`--print`/write-протечка) — добить 0.1.
+2. brief-builder на 1 реальной задаче — влезает ли, покрывает ли.
+3. Baseline-A/B eval-день — go/no-go на full.
