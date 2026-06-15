@@ -7,7 +7,7 @@ description: Multi-model consensus planner — Claude + Codex + DeepSeek indepen
 
 Claude + Codex + DeepSeek V4 Pro **независимо** планируют, кросс-верифицируют друг друга и **обязаны прийти к консенсусу** по material-осям, прежде чем выдать план. Тезис: ансамбль разных семейств обгоняет одну топ-модель, потому что у них разные слепые зоны.
 
-Оркестратор — ты (Claude, главная сессия). Внешние модели зовутся через `skills/fusion/fusion.sh`. **Ты тоже участник** (draft + cross-verify), но **НЕ судья большинством**: консенсус считается механически по голосам, тай разбивает оператор.
+Оркестратор — **хост-модель** (Claude Code или Codex), исполняющая этот playbook. Все 3 участника (`claude`/`codex`/`deepseek`) зовутся **одинаково** через `fusion.sh` (CLI-адаптеры) — оркестратор не привилегирован и **не судит большинством**: консенсус считается механически по голосам, тай разбивает оператор. Поэтому скилл работает идентично под любым хостом.
 
 ## Когда использовать
 Нетривиальная задача, где нужен проработанный план с перебором решений и проверкой допущений. **НЕ** для быстрых ответов и тривиальных правок — там это дорого и медленно (≥1 ч/задача, batch-инструмент).
@@ -22,6 +22,11 @@ Claude + Codex + DeepSeek V4 Pro **независимо** планируют, к
 ## Параметры
 `/fusion <task> --dir <target-repo> [--depth lite|full]`  (lite = 1 раунд, full = 2; по умолчанию full)
 
+**Ростер (configurable, `$FUSION_ROSTER`)** — список участников, передаётся в каждый `fan`/`cross-verify`:
+- mixed (default): `claude codex deepseek`
+- opencode-only: `opencode:opencode-go/glm-5 opencode:opencode-go/kimi-k2.7-code opencode:opencode-go/deepseek-v4-pro`
+- участник = `claude[:model] | codex | opencode:<model> | deepseek`. Ротация cross-verify — циклический сдвиг ростера (i проверяет i+1).
+
 ## Плейбук
 
 Везде: `export FUSION_GUARD_REPO=<target> FUSION_SCRATCH=/tmp/fusion-$TS; RUN=<target>/.fusion/runs/$TS; SH=skills/fusion/fusion.sh`.
@@ -34,14 +39,14 @@ Claude + Codex + DeepSeek V4 Pro **независимо** планируют, к
 
 ### 2. Round 1 — draft
 Собери `$RUN/draft-prompt.txt` = brief + задача + **требование мульти-угла** (рассмотри: не решать / решить сильно проще / зависит от будущих планов / разные сценарии — первый вектор не всегда устойчив).
-- Внешние: `bash "$SH" fan draft $RUN/draft-prompt.txt $RUN codex deepseek`.
-- Claude: произведи свой draft сам → `$RUN/draft/claude.md`.
+- `bash "$SH" fan draft $RUN/draft-prompt.txt $RUN claude codex deepseek` — все 3 параллельно, write-guard.
 - Проверь `$RUN/status.json`: `write_leak=true` → СТОП; <2 участников `ok` → `degraded`.
 
 ### 3. Round 1 — cross-verify (ротация, никто не судит себя)
+Все через `fusion.sh` (можно параллельно — разные модели/файлы), контракт встроен в команду (оси correctness/completeness/assumptions/contradictions/missed-risks + `VERDICT:`-строка):
 - `bash "$SH" cross-verify deepseek $RUN/draft/claude.md $RUN`   (DeepSeek → план Claude)
 - `bash "$SH" cross-verify codex $RUN/draft/deepseek.md $RUN`    (Codex → план DeepSeek)
-- Claude → план Codex: сам, по тому же контракту (оси correctness/completeness/assumptions/contradictions/missed-risks + `VERDICT:`-строка) → `$RUN/cross/claude-on-codex.md`.
+- `bash "$SH" cross-verify claude $RUN/draft/codex.md $RUN`      (Claude → план Codex)
 
 ### 4. Aggregate
 `bash "$SH" collect $RUN` → `$RUN/aggregate.md`.
@@ -60,7 +65,7 @@ key-assumptions: …
 ### 6. Consensus-гейт (механически по VOTES)
 - Для каждой material-оси (`material:true`): все доступные = `reached`? → ось сошлась.
 - Material-ось `split` жива → есть спайкабельное допущение? `bash "$SH" spike "<hypothesis>" --max-files N --max-time S` → structured verdict (`confirmed|refuted|inconclusive`): `confirmed/refuted` обновляет позиции, `inconclusive` → допущение `confidence=LOW`, `UNVERIFIED` в план, ось не блокируется этим пунктом. Дай 1 доп. re-discuss по затронутой оси.
-- Не сошлось после cap (draft-rounds=2, +1 post-spike) → **оператор разбивает тай** (`AskUserQuestion`, только реальная развилка) → `decision=operator_decision`. Оператор недоступен → `decision=blocked`, эмить `BLOCKED: no-consensus` с позициями сторон.
+- Не сошлось после cap (draft-rounds=2, +1 post-spike) → **оператор разбивает тай** (только реальная развилка; в Claude Code — `AskUserQuestion`, в Codex — обычный вопрос оператору текстом) → `decision=operator_decision`. Оператор недоступен → `decision=blocked`, эмить `BLOCKED: no-consensus` с позициями сторон.
 - `material:false` (effort/risk/косметика) НЕ гейтят → в план как ranked-assumption / зафиксированное возражение.
 - Все material `reached` → `decision=consensus`.
 
