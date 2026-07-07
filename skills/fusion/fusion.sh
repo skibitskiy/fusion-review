@@ -38,11 +38,11 @@ _run() {
   case "$kind" in
     claude)   claude -p ${FUSION_CLAUDE_EFFORT:+--effort "$FUSION_CLAUDE_EFFORT"} ${model:+--model "$model"} "$prompt" </dev/null ;;
     codex)    codex exec --sandbox read-only --skip-git-repo-check "$prompt" </dev/null ;;
-    deepseek) opencode run --dir "$repo" \
+    deepseek) OPENCODE_DB=:memory: opencode run --title fusion --dir "$repo" \
                 -m "${FUSION_MODEL_DEEPSEEK:-opencode-go/deepseek-v4-pro}" "$prompt" </dev/null ;;
     opencode|oc)
               [ -n "$model" ] || { echo "opencode participant needs a model: opencode:<model>" >&2; return 98; }
-              opencode run --dir "$repo" -m "$model" "$prompt" </dev/null ;;
+              OPENCODE_DB=:memory: opencode run --title fusion --dir "$repo" -m "$model" "$prompt" </dev/null ;;
     *) echo "unknown participant kind: $kind" >&2; return 99 ;;
   esac
 }
@@ -143,8 +143,8 @@ cmd_spike() {
     case "$kind" in
       claude)      timeout "$TIMEOUT" claude -p ${model:+--model "$model"} "$prompt" ;;
       codex)       timeout "$TIMEOUT" codex exec --sandbox workspace-write "$prompt" ;;
-      deepseek)    timeout "$TIMEOUT" opencode run -m "${FUSION_MODEL_DEEPSEEK:-opencode-go/deepseek-v4-pro}" "$prompt" ;;
-      opencode|oc) timeout "$TIMEOUT" opencode run -m "$model" "$prompt" ;;
+      deepseek)    OPENCODE_DB=:memory: timeout "$TIMEOUT" opencode run -m "${FUSION_MODEL_DEEPSEEK:-opencode-go/deepseek-v4-pro}" "$prompt" ;;
+      opencode|oc) OPENCODE_DB=:memory: timeout "$TIMEOUT" opencode run -m "$model" "$prompt" ;;
       *) echo "spike: unknown participant $participant" >&2; exit 99 ;;
     esac
   ) >"$out" 2>"$dir/spikes/$slug.err"; rc=$?
