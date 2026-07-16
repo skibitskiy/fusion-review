@@ -70,7 +70,7 @@ You only need the CLIs for the models in your roster.
 | Grok | [`grok`](https://grok.com) | `grok login` or `XAI_API_KEY` | `grok -p "say OK"` |
 | GLM / Kimi / DeepSeek / MiniMax… | [`opencode`](https://opencode.ai) | `opencode auth login` (OpenCode Go / OpenRouter) | `opencode run -m opencode-go/glm-5 "say OK"` |
 
-`git`, `bash`, `shasum` are assumed. If a participant's CLI is missing or unauthenticated, fusion drops it and runs `degraded` (and labels the output as such — it won't pretend two models are three).
+`git`, `bash`, `shasum` and GNU `timeout` (macOS: `brew install coreutils`) are assumed — fusion preflights `timeout` and refuses to run without it rather than reporting every participant as a model error. If a participant's CLI is missing or unauthenticated, fusion drops it and runs `degraded` (and labels the output as such — it won't pretend two models are three).
 
 ## Models & rosters
 
@@ -87,6 +87,8 @@ Everything is configured by environment variables — no config files:
 | `FUSION_SCRATCH` | scratch dir for model writes | `/tmp/fusion-scratch` |
 
 Set these in your shell profile (`~/.zshrc` / `~/.bashrc`) for a default roster, or prefix one run: `FUSION_ROSTER="…" /fusion …`.
+
+`fan` reads `$FUSION_ROSTER` itself when called with no participant arguments — prefer that over passing a list. Every `status.json` carries a `roster` block (`configured`, `matches_config`, `missing`, `unconfigured`); if the run doesn't match the configured ensemble, fusion prints a `ROSTER-DRIFT` warning. The point is that `coverage.requested` alone can't tell you whether the ensemble was whole: its denominator comes from the caller, `roster.configured` comes from your config.
 
 > **Instruction isolation.** Grok's claude-compat scan would otherwise load the same `CLAUDE.md` the `claude` participant obeys — a *shared input blind spot*, the very thing an ensemble exists to avoid. Fusion runs `grok` with `GROK_CLAUDE_AGENTS_ENABLED=false` so the two families genuinely differ in what they read.
 
