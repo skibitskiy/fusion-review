@@ -5,10 +5,11 @@
 # A participant is "<kind>[:<model>]":
 #   claude[:<model>]        -> claude -p [--model <model>]
 #   codex                   -> codex exec --sandbox read-only   (model via ~/.codex/config.toml)
+#   grok[:<model>]          -> grok -p --sandbox read-only       (grok-4.5, grok-composer-2.5-fast)
 #   opencode:<model>        -> opencode run -m <model>          (deepseek-v4-pro, opencode-go/glm-5, .../kimi-k2.7-code, ...)
 #   deepseek                -> alias for opencode:$FUSION_MODEL_DEEPSEEK
 # Rosters are just participant lists, e.g.:
-#   mixed:        claude codex deepseek
+#   mixed:        claude codex grok deepseek
 #   opencode-only: opencode:opencode-go/glm-5 opencode:opencode-go/kimi-k2.7-code opencode:opencode-go/deepseek-v4-pro
 # ponytail: status.json built with printf, not jq — fine for v1.
 set -uo pipefail
@@ -38,6 +39,16 @@ _run() {
   case "$kind" in
     claude)   claude -p ${FUSION_CLAUDE_EFFORT:+--effort "$FUSION_CLAUDE_EFFORT"} ${model:+--model "$model"} "$prompt" </dev/null ;;
     codex)    codex exec --sandbox read-only --skip-git-repo-check "$prompt" </dev/null ;;
+    # --no-memory: grok's cross-session memory would carry one run's drafts into the next,
+    # breaking blind-first. --no-subagents: a participant is ONE independent voice, not its
+    # own fan-out (a self-fan would smuggle fake corroboration into a single draft).
+    # GROK_CLAUDE_AGENTS_ENABLED=false: grok's claude-compat scan otherwise loads the same
+    # CLAUDE.md the `claude` participant obeys — shared instructions are a SHARED INPUT BLIND
+    # SPOT, the exact failure v2 exists to prevent. Participants must differ in what they read.
+    grok)     GROK_CLAUDE_AGENTS_ENABLED=false \
+              grok -p "$prompt" --cwd "$repo" ${model:+-m "$model"} \
+                ${FUSION_GROK_EFFORT:+--effort "$FUSION_GROK_EFFORT"} \
+                --sandbox read-only --no-memory --no-subagents </dev/null ;;
     deepseek) OPENCODE_DB=:memory: opencode run --title fusion --dir "$repo" \
                 -m "${FUSION_MODEL_DEEPSEEK:-opencode-go/deepseek-v4-pro}" "$prompt" </dev/null ;;
     opencode|oc)
@@ -143,6 +154,9 @@ cmd_spike() {
     case "$kind" in
       claude)      timeout "$TIMEOUT" claude -p ${model:+--model "$model"} "$prompt" ;;
       codex)       timeout "$TIMEOUT" codex exec --sandbox workspace-write "$prompt" ;;
+      grok)        GROK_CLAUDE_AGENTS_ENABLED=false \
+                   timeout "$TIMEOUT" grok -p "$prompt" ${model:+-m "$model"} \
+                     --sandbox workspace --always-approve --no-memory --no-subagents ;;
       deepseek)    OPENCODE_DB=:memory: timeout "$TIMEOUT" opencode run -m "${FUSION_MODEL_DEEPSEEK:-opencode-go/deepseek-v4-pro}" "$prompt" ;;
       opencode|oc) OPENCODE_DB=:memory: timeout "$TIMEOUT" opencode run -m "$model" "$prompt" ;;
       *) echo "spike: unknown participant $participant" >&2; exit 99 ;;
@@ -182,7 +196,7 @@ fusion.sh — minimal multi-model fan-out harness
   selftest [participant]                           smoke the harness; PASS/FAIL
   cleanup                                          remove orphan worktrees + scratch
 
-  participant = claude[:model] | codex | opencode:<model> | deepseek
+  participant = claude[:model] | codex | grok[:model] | opencode:<model> | deepseek
 USAGE
 }
 

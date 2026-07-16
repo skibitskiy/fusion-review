@@ -67,6 +67,7 @@ You only need the CLIs for the models in your roster.
 |---|---|---|---|
 | Claude | [`claude`](https://docs.claude.com/claude-code) | Claude Code login or `ANTHROPIC_API_KEY` | `claude -p "say OK"` |
 | Codex / GPT | [`codex`](https://developers.openai.com/codex/cli) | `codex login` (ChatGPT) or `OPENAI_API_KEY` | `codex exec "say OK"` |
+| Grok | [`grok`](https://grok.com) | `grok login` or `XAI_API_KEY` | `grok -p "say OK"` |
 | GLM / Kimi / DeepSeek / MiniMax… | [`opencode`](https://opencode.ai) | `opencode auth login` (OpenCode Go / OpenRouter) | `opencode run -m opencode-go/glm-5 "say OK"` |
 
 `git`, `bash`, `shasum` are assumed. If a participant's CLI is missing or unauthenticated, fusion drops it and runs `degraded` (and labels the output as such — it won't pretend two models are three).
@@ -80,13 +81,16 @@ Everything is configured by environment variables — no config files:
 | `FUSION_ROSTER` | participant list | `claude codex deepseek` |
 | `FUSION_MODEL_DEEPSEEK` | model for the `deepseek` alias | `opencode-go/deepseek-v4-pro` |
 | `FUSION_MODEL_CLAUDE` | `--model` for `claude` | CLI default |
+| `FUSION_GROK_EFFORT` | `--effort` for `grok` | CLI default |
 | `FUSION_TIMEOUT` | per-call timeout (s) | `300` |
 | `FUSION_GUARD_REPO` | repo the write-guard watches | `$PWD` |
 | `FUSION_SCRATCH` | scratch dir for model writes | `/tmp/fusion-scratch` |
 
 Set these in your shell profile (`~/.zshrc` / `~/.bashrc`) for a default roster, or prefix one run: `FUSION_ROSTER="…" /fusion …`.
 
-A participant is `claude[:model]` · `codex` · `opencode:<model>` · `deepseek` (alias). So you can run a **fully opencode-only** ensemble of three different families:
+> **Instruction isolation.** Grok's claude-compat scan would otherwise load the same `CLAUDE.md` the `claude` participant obeys — a *shared input blind spot*, the very thing an ensemble exists to avoid. Fusion runs `grok` with `GROK_CLAUDE_AGENTS_ENABLED=false` so the two families genuinely differ in what they read.
+
+A participant is `claude[:model]` · `codex` · `grok[:model]` · `opencode:<model>` · `deepseek` (alias). So you can run a **fully opencode-only** ensemble of three different families:
 
 ```bash
 export FUSION_ROSTER="opencode:opencode-go/glm-5 opencode:opencode-go/kimi-k2.7-code opencode:opencode-go/deepseek-v4-pro"

@@ -26,7 +26,7 @@ A non-trivial task that needs a hardened plan with real alternatives and checked
 ## Parameters
 `/fusion <task> --dir <target-repo> [--depth lite|full] [--force-plan]`  (lite = 1 round, full = 2; default full. `--force-plan` skips the LOCATE phase only when the operator asserts the root is already pinned.)
 
-**Roster (`$FUSION_ROSTER`)** — participant list. participant = `claude[:model] | codex | opencode:<model> | deepseek`. Cross-verify rotation = cyclic shift (i verifies i+1).
+**Roster (`$FUSION_ROSTER`)** — participant list. participant = `claude[:model] | codex | grok[:model] | opencode:<model> | deepseek`. Cross-verify rotation = cyclic shift (i verifies i+1).
 **Layer lenses (optional, recommended for cross-layer bugs):** assign each drafter a primary lens — `client-reactive` / `server-lifecycle` / `protocol-schema` / `infra-latency` — passed as a line in the draft prompt. The lens biases attention; **every drafter still sees the full brief** (lens ≠ shard).
 
 ## Playbook
