@@ -1,11 +1,11 @@
 ---
 name: fusion
-description: Multi-model consensus planner (v2) — routes bug/unknown-root tasks through a LOCATE-the-fault phase before planning, gathers diverse real evidence (reproduce + probe + multi-modal sweep) BEFORE reasoning, then has Claude + Codex + DeepSeek (+ others) independently draft over a full vertical-slice brief, cross-verify each other (incl. a wrong-layer adversary), survive a pre-mortem, and reach consensus on material axes before any plan is emitted. Use for a non-trivial task that needs a maximally hardened plan OR a root-cause that must not be mis-located. Output is a plan; implementation is out of scope (hand to forge/improve).
+description: Multi-model consensus planner (v2) — routes bug/unknown-root tasks through a LOCATE-the-fault phase before planning, gathers diverse real evidence (reproduce + probe + multi-modal sweep) BEFORE reasoning, then has every model in your $FUSION_ROSTER independently draft over a full vertical-slice brief, cross-verify each other (incl. a wrong-layer adversary), survive a pre-mortem, and reach consensus on material axes before any plan is emitted. Use for a non-trivial task that needs a maximally hardened plan OR a root-cause that must not be mis-located. Output is a plan; implementation is out of scope (hand to forge/improve).
 ---
 
 # fusion v2 — locate-then-plan, evidence-first multi-model consensus
 
-Claude + Codex + DeepSeek V4 Pro (or any models you reach through opencode) **independently** draft a plan, cross-verify one another, and **must reach consensus** on the material axes before a plan is emitted. Premise: an ensemble of different families beats one frontier model because their blind spots differ — **but only if they don't share the SAME input blind spot.** v2 exists because v1 lost to a single human teammate on a real bug: the host cut a symptom-scoped brief (one layer), all 5 models reasoned over it, and the true root lived in a layer (protocol/schema decode) that was never in the brief or probed. The teammate won by *running it and seeing the error*. v2 fixes that structurally: **observe before you reason; locate before you plan; treat the brief boundary as the enemy.**
+Every model configured in `$FUSION_ROSTER` — different families, whatever you chose — **independently** drafts a plan, cross-verifies another, and they **must reach consensus** on the material axes before a plan is emitted. Premise: an ensemble of different families beats one frontier model because their blind spots differ — **but only if they don't share the SAME input blind spot.** v2 exists because v1 lost to a single human teammate on a real bug: the host cut a symptom-scoped brief (one layer), all 5 models reasoned over it, and the true root lived in a layer (protocol/schema decode) that was never in the brief or probed. The teammate won by *running it and seeing the error*. v2 fixes that structurally: **observe before you reason; locate before you plan; treat the brief boundary as the enemy.**
 
 The orchestrator is **the host model** (Claude Code or Codex) running this playbook. All reasoning participants are called the same way through `fusion.sh`, so the orchestrator is not privileged and **does not decide by majority**: consensus is computed mechanically from votes, tie broken by the operator.
 
@@ -27,6 +27,7 @@ A non-trivial task that needs a hardened plan with real alternatives and checked
 `/fusion <task> --dir <target-repo> [--depth lite|full] [--force-plan]`  (lite = 1 round, full = 2; default full. `--force-plan` skips the LOCATE phase only when the operator asserts the root is already pinned.)
 
 **Roster (`$FUSION_ROSTER`)** — participant list. participant = `claude[:model] | codex | grok[:model] | opencode:<model> | deepseek`. Cross-verify rotation = cyclic shift (i verifies i+1).
+**Never expand the roster by hand.** Call `fan` with NO participant arguments and let it read `$FUSION_ROSTER` itself. The host silently substituting its own list is a real, observed failure (runs went 7-of-7, then 3-of-7, then invented a participant that was never configured) — and because `coverage.requested` counted whatever the host passed, a third of the ensemble reported as full coverage. `status.json.roster.matches_config: false` (+ a `ROSTER-DRIFT` warning) now means the run is NOT the configured ensemble: treat it like `write_leak` — stop and fix the call, don't narrate around it.
 **Layer lenses (optional, recommended for cross-layer bugs):** assign each drafter a primary lens — `client-reactive` / `server-lifecycle` / `protocol-schema` / `infra-latency` — passed as a line in the draft prompt. The lens biases attention; **every drafter still sees the full brief** (lens ≠ shard).
 
 ## Playbook
@@ -42,7 +43,7 @@ Classify the task in one line and write `$RUN/routing.md`:
 Load any relevant fusion post-mortems + repo memory (e.g. prior spikes/“seam” notes) and **explicitly check them against the task** — the lesson that would have saved v1 already existed in memory and went unconsulted.
 
 ### 0. Setup
-`bash "$SH" cleanup`. `mkdir -p $RUN`.
+`bash "$SH" cleanup`. `mkdir -p $RUN`. `fan`/`spike` preflight GNU `timeout` and refuse to run without it (macOS: `brew install coreutils`) — never let a missing harness be read as "every model errored".
 
 ### 1. LOCATE — evidence FIRST (reproduce · probe · multi-modal sweep)
 Do this with your own tools (Bash/agents) AND `fusion.sh spike` — BEFORE any model drafts.
@@ -100,7 +101,8 @@ Problem · Constraints (union) · **Confirmed fault location + how it was observ
 Append a one-paragraph post-mortem to fusion memory: the symptom, the layer the root actually lived in, the probe that found it (or should have), and which brief layer was missing. The next run's Phase R loads it. This is how v2 stops repeating v1.
 
 ## Degraded / failures
-- timeout/exit≠0/empty → `fan` retried; mark `timeout/error`, continue if ≥2.
+- timeout/exit≠0/empty → `fan` retried **into a fresh run dir or a new role name**; mark `timeout/error`, continue if ≥2. A sealed round is Δ2-immutable: re-running `fan` on the same role now refuses with exit 95 (it used to hit `Permission denied` per participant and report `ok:0, degraded:true` while the previous drafts sat intact — a harness failure wearing a model failure's face).
+- `ROSTER-DRIFT` / `roster.matches_config: false` → the run is not the configured ensemble. Re-run `fan` with no participant args. Dropping a participant is legitimate ONLY when its CLI is missing/unauthenticated — and then it is `degraded`, named as such, never quietly.
 - codex `quota` → drop it. 2 families → `degraded: two-model` (mutual cross-verify, any unresolved material split → operator). 1 family → `degraded: claude-only`, `DEGRADED` in title.
 - spike `refuted` → blocks dependent branch; `inconclusive` → LOW/UNVERIFIED, no block.
 - LOCATE could not reach ground truth (no repro, no logs) → every root cause is a HYPOTHESIS; the plan leads with the probes needed and says so. Do not launder a hypothesis into a confirmed fix.

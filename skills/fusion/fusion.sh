@@ -20,6 +20,25 @@ SCRATCH="${FUSION_SCRATCH:-/tmp/fusion-scratch}"
 
 _slug() { printf '%s' "$1" | tr '/:' '__'; }   # participant -> safe filename
 
+# _timeout — GNU timeout(1) under either name. Stock macOS ships NEITHER (coreutils installs
+# `gtimeout`, or `timeout` only with gnubin on PATH). This matters more than portability
+# pedantry: a bare `timeout` call exits 127 *per participant*, and status.json faithfully
+# records that as `error` — a harness that is simply not installed looks EXACTLY like "every
+# model failed". Fail loudly, once, in preflight instead of laundering it into model errors.
+_timeout() {
+  if command -v timeout >/dev/null 2>&1; then command timeout "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then command gtimeout "$@"
+  else return 127
+  fi
+}
+_preflight() {
+  command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 || {
+    echo "fusion: no timeout(1) on PATH — every participant would fail with exit 127 and be" >&2
+    echo "        misreported as a model error. Install it: brew install coreutils" >&2
+    return 127
+  }
+}
+
 # _run <participant> <promptfile>  — dispatch one model call, answer to stdout.
 # Δ2 isolation (corrected): a drafter NEEDS live repo read-access to go read the code it
 # wants — the brief can't pre-include everything. So every participant runs WITH the repo as
@@ -61,15 +80,32 @@ _run() {
 # signature of target repo's tracked state — detect write-leaks from participants
 _repo_sig() { git -C "${FUSION_GUARD_REPO:-$PWD}" status --porcelain 2>/dev/null | shasum | awk '{print $1}'; }
 
-# fan <role> <promptfile> <dir> <participant...>  — parallel, write-guarded, status.json
+# fan <role> <promptfile> <dir> [participant...]  — parallel, write-guarded, status.json
+# Participants default to $FUSION_ROSTER: the roster used to be documentation-only (nothing in
+# this script ever read it), so the host model expanded `<roster>` by hand — and in real runs
+# it drifted (7 of 7 once, 3 of 7 another time, and once a 4th participant that was never
+# configured at all). Reading the env here makes the configured roster the default truth
+# instead of a suggestion the caller may reinterpret.
 cmd_fan() {
   local role="$1" prompt="$2" dir="$3"; shift 3
+  _preflight || return 127
+  [ $# -eq 0 ] && set -- ${FUSION_ROSTER:-}
+  [ $# -eq 0 ] && { echo "fan: no participants and \$FUSION_ROSTER is empty" >&2; return 96; }
+  # A sealed round is immutable by design (Δ2), so re-running into it makes every redirect fail
+  # with "Permission denied" -> exit 1 -> `ok:0, degraded:true`, while the previous round's good
+  # drafts still sit in those files. The documented retry path therefore reported "every model
+  # failed" for a pure harness reason. Refuse instead: sealing and retrying must not both win.
+  if [ -f "$dir/$role/SEALED.manifest" ]; then
+    echo "fan: '$role' is already sealed in $dir (Δ2 immutable). Retry into a FRESH run dir," >&2
+    echo "     or use a new role name — never re-run into a sealed round." >&2
+    return 95
+  fi
   mkdir -p "$dir/$role" "$SCRATCH"
   local sig_before sig_after leak=false p slug
   sig_before="$(_repo_sig)"
   for p in "$@"; do
     slug="$(_slug "$p")"
-    ( timeout "$TIMEOUT" bash "$0" _run "$p" "$prompt" \
+    ( _timeout "$TIMEOUT" bash "$0" _run "$p" "$prompt" \
         >"$dir/$role/$slug.md" 2>"$dir/$role/$slug.err"
       echo "$?" >"$dir/$role/$slug.exit" ) &
   done
@@ -109,7 +145,7 @@ cmd_cross_verify() {
     echo "--- ПЛАН: ---"
     cat "$target"
   } >"$pf"
-  ( timeout "$TIMEOUT" bash "$0" _run "$verifier" "$pf" \
+  ( _timeout "$TIMEOUT" bash "$0" _run "$verifier" "$pf" \
       >"$dir/cross/$vslug-on-$base.md" 2>"$dir/cross/$vslug-on-$base.err"
     echo "$?" >"$dir/cross/$vslug-on-$base.exit" )
 }
@@ -142,6 +178,7 @@ cmd_cleanup() {
 # (write-enabled but isolated; the worktree is always removed). Prints a VERDICT line.
 cmd_spike() {
   local hyp="$1" dir="$2" participant="${3:-deepseek}"
+  _preflight || return 127
   mkdir -p "$dir/spikes"
   local slug; slug="$(printf '%s' "$hyp" | tr -c 'a-zA-Z0-9' '_' | cut -c1-48)"
   local out="$dir/spikes/$slug.md" repo wt rc
@@ -152,13 +189,13 @@ cmd_spike() {
   local kind="${participant%%:*}" model=""; [ "$participant" != "$kind" ] && model="${participant#*:}"
   ( cd "$wt" || exit 97
     case "$kind" in
-      claude)      timeout "$TIMEOUT" claude -p ${model:+--model "$model"} "$prompt" ;;
-      codex)       timeout "$TIMEOUT" codex exec --sandbox workspace-write "$prompt" ;;
+      claude)      _timeout "$TIMEOUT" claude -p ${model:+--model "$model"} "$prompt" ;;
+      codex)       _timeout "$TIMEOUT" codex exec --sandbox workspace-write "$prompt" ;;
       grok)        GROK_CLAUDE_AGENTS_ENABLED=false \
-                   timeout "$TIMEOUT" grok -p "$prompt" ${model:+-m "$model"} \
+                   _timeout "$TIMEOUT" grok -p "$prompt" ${model:+-m "$model"} \
                      --sandbox workspace --always-approve --no-memory --no-subagents ;;
-      deepseek)    OPENCODE_DB=:memory: timeout "$TIMEOUT" opencode run -m "${FUSION_MODEL_DEEPSEEK:-opencode-go/deepseek-v4-pro}" "$prompt" ;;
-      opencode|oc) OPENCODE_DB=:memory: timeout "$TIMEOUT" opencode run -m "$model" "$prompt" ;;
+      deepseek)    OPENCODE_DB=:memory: _timeout "$TIMEOUT" opencode run -m "${FUSION_MODEL_DEEPSEEK:-opencode-go/deepseek-v4-pro}" "$prompt" ;;
+      opencode|oc) OPENCODE_DB=:memory: _timeout "$TIMEOUT" opencode run -m "$model" "$prompt" ;;
       *) echo "spike: unknown participant $participant" >&2; exit 99 ;;
     esac
   ) >"$out" 2>"$dir/spikes/$slug.err"; rc=$?
@@ -171,6 +208,9 @@ cmd_spike() {
 # selftest [participant]  — cleanup + a trivial fan smoke; prints PASS/FAIL, exit 0 on PASS
 cmd_selftest() {
   local participant="${1:-codex}" dir
+  # Preflight here too: without it a missing timeout(1) surfaces as "FAIL — <p>: exit 99",
+  # blaming the participant for a harness that was never installed.
+  _preflight || { echo "FAIL — $participant: harness preflight (timeout(1) missing)"; return 1; }
   dir="$(mktemp -d "${TMPDIR:-/tmp}/fusion-selftest-XXXXXX")"
   cmd_cleanup >/dev/null 2>&1 || true
   printf 'Reply with exactly: OK\n' >"$dir/p.txt"
@@ -200,6 +240,32 @@ fusion.sh — minimal multi-model fan-out harness
 USAGE
 }
 
+# _roster_json <participant...> — roster-vs-config block. The denominator must come from
+# CONFIG, not from the caller: `coverage.requested` counts whatever the host passed, so a run
+# of 3-out-of-7 reports `requested:3, ok:3` and reads as full coverage. Two distinct drifts are
+# both observed in real runs and both caught here: `missing` (configured but not run) and
+# `unconfigured` (run but never configured — an invented participant).
+_roster_json() {
+  local configured="${FUSION_ROSTER:-}" p c found n=0 missing="" extra=""
+  if [ -z "$configured" ]; then
+    printf '"roster":{"configured":null,"matches_config":null}'; return
+  fi
+  for c in $configured; do
+    n=$((n+1)); found=false
+    for p in "$@"; do [ "$p" = "$c" ] && { found=true; break; }; done
+    [ "$found" = false ] && missing="$missing${missing:+,}\"$c\""
+  done
+  for p in "$@"; do
+    found=false
+    for c in $configured; do [ "$p" = "$c" ] && { found=true; break; }; done
+    [ "$found" = false ] && extra="$extra${extra:+,}\"$p\""
+  done
+  local match=true
+  { [ -n "$missing" ] || [ -n "$extra" ]; } && match=false
+  printf '"roster":{"configured":%d,"matches_config":%s,"missing":[%s],"unconfigured":[%s]}' \
+    "$n" "$match" "$missing" "$extra"
+}
+
 # _status <dir> <role> <leak> <participant...>
 # Coverage-denominator discipline: status.json carries a `coverage` block so no consumer can
 # read "ok" without "requested". `degraded` is computed mechanically (ok<2 families = not a
@@ -217,9 +283,14 @@ _status() {
       printf '"%s":{"exit":%s,"status":"%s"}' "$p" "$ex" "$st"
     done
     [ "$ok" -lt 2 ] && degraded=true || degraded=false
-    printf '},"coverage":{"requested":%d,"ok":%d,"timeout":%d,"error":%d,"degraded":%s}}' \
+    printf '},"coverage":{"requested":%d,"ok":%d,"timeout":%d,"error":%d,"degraded":%s},' \
       "$requested" "$ok" "$timeout" "$error" "$degraded"
+    _roster_json "$@"
+    printf '}'
   } >"$sf"
+  # Loud on stderr too: a JSON field nobody reads is not a guarantee.
+  grep -q '"matches_config":false' "$sf" && \
+    echo "ROSTER-DRIFT: run does not match \$FUSION_ROSTER — see roster.missing / roster.unconfigured in $sf" >&2
   cat "$sf"
 }
 
