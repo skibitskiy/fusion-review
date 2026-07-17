@@ -6,7 +6,7 @@
 #   claude[:<model>]        -> claude -p [--model <model>]
 #   codex                   -> codex exec --sandbox read-only   (model via ~/.codex/config.toml)
 #   grok[:<model>]          -> grok -p --sandbox read-only       (grok-4.5, grok-composer-2.5-fast)
-#   opencode:<model>        -> opencode run -m <model>          (deepseek-v4-pro, opencode-go/glm-5, .../kimi-k2.7-code, ...)
+#   opencode:<model>        -> opencode run -m <model> (read-only via OPENCODE_CONFIG_CONTENT; deepseek-v4-pro, opencode-go/glm-5, .../kimi-k2.7-code, ...)
 #   deepseek                -> alias for opencode:$FUSION_MODEL_DEEPSEEK
 # Rosters are just participant lists, e.g.:
 #   mixed:        claude codex grok deepseek
@@ -17,6 +17,11 @@ set -uo pipefail
 RUN_ROOT="${FUSION_RUN_ROOT:-.fusion/runs}"
 TIMEOUT="${FUSION_TIMEOUT:-300}"
 SCRATCH="${FUSION_SCRATCH:-/tmp/fusion-scratch}"
+
+# Read-only rights for opencode drafters — the equivalent of codex/grok's --sandbox read-only,
+# which opencode has no flag for. Passed inline via OPENCODE_CONFIG_CONTENT (no temp file), so
+# many concurrent copies each carry their own rights with no shared-file race.
+FUSION_OC_READONLY='{"permission":{"edit":"deny","bash":"deny"}}'
 
 _slug() { printf '%s' "$1" | tr '/:' '__'; }   # participant -> safe filename
 
@@ -68,11 +73,17 @@ _run() {
               grok -p "$prompt" --cwd "$repo" ${model:+-m "$model"} \
                 ${FUSION_GROK_EFFORT:+--effort "$FUSION_GROK_EFFORT"} \
                 --sandbox read-only --no-memory --no-subagents </dev/null ;;
-    deepseek) OPENCODE_DB=:memory: opencode run --title fusion --dir "$repo" \
+    # opencode has no --sandbox flag (unlike codex/grok); read-only is enforced via a
+    # rights config passed inline through OPENCODE_CONFIG_CONTENT (no temp file -> safe under
+    # many concurrent copies). edit+bash deny blocks all writes; repo reads still work because
+    # opencode reads via read/grep/glob tools, not bash. WRITE-LEAK guard stays as backstop.
+    deepseek) OPENCODE_DB=:memory: OPENCODE_CONFIG_CONTENT="$FUSION_OC_READONLY" \
+                opencode run --title fusion --dir "$repo" \
                 -m "${FUSION_MODEL_DEEPSEEK:-opencode-go/deepseek-v4-pro}" "$prompt" </dev/null ;;
     opencode|oc)
               [ -n "$model" ] || { echo "opencode participant needs a model: opencode:<model>" >&2; return 98; }
-              OPENCODE_DB=:memory: opencode run --title fusion --dir "$repo" -m "$model" "$prompt" </dev/null ;;
+              OPENCODE_DB=:memory: OPENCODE_CONFIG_CONTENT="$FUSION_OC_READONLY" \
+                opencode run --title fusion --dir "$repo" -m "$model" "$prompt" </dev/null ;;
     *) echo "unknown participant kind: $kind" >&2; return 99 ;;
   esac
 }
