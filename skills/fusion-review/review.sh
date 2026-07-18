@@ -33,6 +33,13 @@ FUSION_OC_READONLY='{"permission":{"edit":"deny","bash":"deny"}}'
 
 _slug() { printf '%s' "$1" | tr '/:' '__'; }   # participant -> safe filename
 
+# _roster — the roster, from $FUSION_REVIEW_ROSTER only. Deliberately NO fallback to the planner's
+# $FUSION_ROSTER: review fans N reviewers AND ~2 judges per finding, so a roster sized for planning
+# silently turns into a much bigger, slower, more expensive run here. A forgotten variable must fail
+# loudly, not quietly spend. Both the `fan` default and the drift check read THIS function, so they
+# can never disagree about what the configured ensemble is.
+_roster() { printf '%s' "${FUSION_REVIEW_ROSTER:-}"; }
+
 # _timeout — GNU timeout(1) under either name. Stock macOS ships NEITHER (coreutils installs
 # `gtimeout`, or `timeout` only with gnubin on PATH). This matters more than portability
 # pedantry: a bare `timeout` call exits 127 *per participant*, and status.json faithfully
@@ -100,7 +107,7 @@ _run() {
 _repo_sig() { git -C "${FUSION_GUARD_REPO:-$PWD}" status --porcelain 2>/dev/null | shasum | awk '{print $1}'; }
 
 # fan <role> <promptfile> <dir> [participant...]  — parallel, write-guarded, status.json
-# Participants default to $FUSION_ROSTER: the roster used to be documentation-only (nothing in
+# Participants default to $FUSION_REVIEW_ROSTER: the roster used to be documentation-only (nothing in
 # this script ever read it), so the host model expanded `<roster>` by hand — and in real runs
 # it drifted (7 of 7 once, 3 of 7 another time, and once a 4th participant that was never
 # configured at all). Reading the env here makes the configured roster the default truth
@@ -108,8 +115,9 @@ _repo_sig() { git -C "${FUSION_GUARD_REPO:-$PWD}" status --porcelain 2>/dev/null
 cmd_fan() {
   local role="$1" prompt="$2" dir="$3"; shift 3
   _preflight || return 127
-  [ $# -eq 0 ] && set -- ${FUSION_ROSTER:-}
-  [ $# -eq 0 ] && { echo "fan: no participants and \$FUSION_ROSTER is empty" >&2; return 96; }
+  # shellcheck disable=SC2046  # word-splitting the roster into participants is the point
+  [ $# -eq 0 ] && set -- $(_roster)
+  [ $# -eq 0 ] && { echo "fan: no participants and \$FUSION_REVIEW_ROSTER is not set (it has no fallback --" >&2; echo "     a planner-sized roster would silently make this run far bigger)" >&2; return 96; }
   # A sealed round is immutable by design (Δ2), so re-running into it makes every redirect fail
   # with "Permission denied" -> exit 1 -> `ok:0, degraded:true`, while the previous round's good
   # drafts still sit in those files. The documented retry path therefore reported "every model
@@ -292,13 +300,105 @@ cmd_selftest() {
   echo "FAIL — $participant: exit $ex, ${bytes} bytes"; return 1
 }
 
+# triage <dir> [role] — parse the reviews in <dir>/<role>/, dedupe findings, and emit
+#   findings/<nnn>.md · judge-plan.tsv · unparsed.md  + a one-line summary with every denominator.
+#
+# This lives in the harness rather than the playbook ON PURPOSE. Two of its steps fail SILENTLY when
+# a host does them by hand:
+#   - routing a finding to a participant that authored it yields `real` from an echo, and nothing in
+#     the output reveals it happened;
+#   - asking a model to "merge the duplicates" drops findings, and you cannot tell from the result.
+# Both are unfalsifiable after the fact, which is the same shape as the roster drift this project
+# already got burned by. So: mechanical step, mechanical implementation.
+cmd_triage() {
+  local dir="$1" role="${2:-review}"
+  local rd="$dir/$role" raw="$dir/findings.tsv" un="$dir/unparsed.md" fdir="$dir/findings"
+  [ -d "$rd" ] || { echo "triage: no round dir $rd" >&2; return 94; }
+  rm -rf "$fdir"; mkdir -p "$fdir"; : >"$raw"; : >"$un"
+  local f p
+  for f in "$rd"/*.md; do
+    [ -f "$f" ] || continue
+    p="$(basename "$f" .md)"
+    # A finding is `[SEV] axis file:line — gist — proof`. A line missing the location or the proof
+    # is NOT downgraded into a vague finding — it goes to unparsed.md and stays in the denominator.
+    awk -v P="$p" -v UN="$un" '
+      function trim(x){ sub(/^[ \t]+/,"",x); sub(/[ \t]+$/,"",x); return x }
+      {
+        line=$0
+        sub(/^[ \t]*[-*][ \t]*/,"",line)               # tolerate a markdown bullet
+        if (line !~ /^\[(BLOCKER|MAJOR|MINOR)\]/) next
+        split(line,t,/[ \t]+/)
+        sev=t[1]; gsub(/[][]/,"",sev); axis=t[2]; loc=t[3]
+        if (match(loc,/:[0-9]+$/)==0) { print line >> UN; next }
+        file=substr(loc,1,RSTART-1); ln=substr(loc,RSTART+1)+0
+        body=substr(line, index(line,loc)+length(loc))
+        if (gsub(/—|--/,"@@S@@",body) < 2) { print line >> UN; next }   # no proof section
+        split(body,b,"@@S@@")
+        gist=trim(b[2]); proof=trim(b[3])
+        if (file=="" || ln<=0 || gist=="" || proof=="") { print line >> UN; next }
+        gsub(/\t/," ",gist); gsub(/\t/," ",proof)
+        printf "%s\t%d\t%s\t%s\t%s\t%s\t%s\n", file, ln, axis, sev, P, gist, proof
+      }' "$f" >>"$raw"
+  done
+
+  # Cluster on (file, axis, line within 3) — two models describing one bug rarely agree on the exact
+  # line. The cluster keeps the HIGHEST severity reported, and every raw report is preserved beneath
+  # it, so merging never silently discards a participant's wording.
+  LC_ALL=C sort -t"$(printf '\t')" -k1,1 -k3,3 -k2,2n "$raw" | awk -F'\t' -v OUT="$fdir" '
+    function rank(x){ return x=="BLOCKER"?3:(x=="MAJOR"?2:1) }
+    function flush(  i,fn,srcs) {
+      if (ck=="") return
+      n++; fn=sprintf("%s/%03d.md", OUT, n); srcs=""
+      for (i=1;i<=ns;i++) srcs = srcs (srcs==""?"":", ") src[i]
+      printf "id: %03d\nseverity: %s\naxis: %s\nlocation: %s:%d\nsources: %s\n\n", n, bsev, caxis, cfile, bline, srcs > fn
+      printf "[%s] %s %s:%d — %s — %s\n", bsev, caxis, cfile, bline, bgist, bproof > fn
+      printf "\nraw reports:\n" > fn
+      for (i=1;i<=nv;i++) printf "- %s\n", var[i] > fn
+      close(fn); ck=""; ns=0; nv=0
+    }
+    {
+      key=$1 "\t" $3
+      if (key!=ck || $2-lastline>3) { flush(); ck=key; cfile=$1; caxis=$3; bline=$2; bsev=$4; bgist=$6; bproof=$7 }
+      lastline=$2
+      if (rank($4)>rank(bsev)) { bsev=$4; bline=$2; bgist=$6; bproof=$7 }
+      dup=0; for(i=1;i<=ns;i++) if(src[i]==$5) dup=1
+      if(!dup) src[++ns]=$5
+      var[++nv]=sprintf("[%s] %s:%d (%s) — %s", $4, $1, $2, $5, $6)
+    }
+    END { flush() }'
+
+  # Judge routing: 2 participants per finding, NEVER one of its sources (see the header comment).
+  local fn id srcs c chosen short=0
+  : >"$dir/judge-plan.tsv"
+  for fn in "$fdir"/*.md; do
+    [ -f "$fn" ] || continue
+    id="$(basename "$fn" .md)"
+    srcs="$(awk -F'sources: ' '/^sources: /{print $2; exit}' "$fn")"
+    chosen=0
+    for c in $(_roster); do
+      case ",$(printf '%s' "$srcs" | tr -d ' ')," in *",$(_slug "$c"),"*) continue ;; esac
+      printf '%s\t%s\n' "$id" "$c" >>"$dir/judge-plan.tsv"
+      chosen=$((chosen+1)); [ "$chosen" -ge 2 ] && break
+    done
+    [ "$chosen" -lt 2 ] && { short=$((short+1)); echo "triage: finding $id has only $chosen non-author judge(s) — mark it judged: $chosen/2 (degraded)" >&2; }
+  done
+
+  local n_raw n_find n_un n_pair
+  n_raw="$(grep -c . "$raw" 2>/dev/null || echo 0)"
+  n_un="$(grep -c . "$un" 2>/dev/null || echo 0)"
+  n_find="$(find "$fdir" -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+  n_pair="$(grep -c . "$dir/judge-plan.tsv" 2>/dev/null || echo 0)"
+  echo "triage: raw=$n_raw deduped=$n_find unparsed=$n_un judge-pairs=$n_pair under-judged=$short roster=$(_roster | wc -w | tr -d ' ')"
+}
+
 _usage() {
   cat <<'USAGE'
 review.sh — minimal multi-model fan-out harness for code review
 
   fan <role> <promptfile> <dir> [participant...]      run participants in parallel (write-guarded;
-                                                      no args => roster from $FUSION_ROSTER)
+                                                      no args => roster from $FUSION_REVIEW_ROSTER)
   cross-verify <verifier> <target-review> <dir> [pf]  idiot-test one review (missed + false-positive)
+  triage <dir> [role]                                 parse+dedupe reviews -> findings/ + judge-plan.tsv
   judge <participant> <finding-file> <dir>            adversarially refute ONE finding; prints VERDICT
   spike <hypothesis> <dir> [participant]              reproduce a finding in a throwaway worktree
   collect <dir>                                       concat run artifacts into aggregate.md
@@ -315,7 +415,8 @@ USAGE
 # both observed in real runs and both caught here: `missing` (configured but not run) and
 # `unconfigured` (run but never configured — an invented participant).
 _roster_json() {
-  local configured="${FUSION_ROSTER:-}" p c found n=0 missing="" extra=""
+  local configured p c found n=0 missing="" extra=""
+  configured="$(_roster)"
   if [ -z "$configured" ]; then
     printf '"roster":{"configured":null,"matches_config":null}'; return
   fi
@@ -359,7 +460,7 @@ _status() {
   } >"$sf"
   # Loud on stderr too: a JSON field nobody reads is not a guarantee.
   grep -q '"matches_config":false' "$sf" && \
-    echo "ROSTER-DRIFT: run does not match \$FUSION_ROSTER — see roster.missing / roster.unconfigured in $sf" >&2
+    echo "ROSTER-DRIFT: run does not match \$FUSION_REVIEW_ROSTER — see roster.missing / roster.unconfigured in $sf" >&2
   cat "$sf"
 }
 
@@ -369,6 +470,7 @@ main() {
     _run)         _run "$@" ;;
     fan)          cmd_fan "$@" ;;
     cross-verify) cmd_cross_verify "$@" ;;
+    triage)       cmd_triage "$@" ;;
     judge)        cmd_judge "$@" ;;
     spike)        cmd_spike "$@" ;;
     collect)      cmd_collect "$@" ;;

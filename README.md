@@ -3,7 +3,7 @@
 [![CI](https://github.com/skibitskiy/fusion-review/actions/workflows/ci.yml/badge.svg)](https://github.com/skibitskiy/fusion-review/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Multi-model adversarial code review.** Every model you put in `$FUSION_ROSTER` — Claude, Codex, Grok, or anything you reach through [opencode](https://opencode.ai) (GLM, Kimi, DeepSeek, MiniMax…) — reviews **the same diff independently** under a different lens, then attacks the others' output: what did they *miss*, and which of their findings don't survive a refutation attempt. The output is a triaged findings report — fusion-review never touches your code.
+**Multi-model adversarial code review.** Every model you put in `$FUSION_REVIEW_ROSTER` — Claude, Codex, Grok, or anything you reach through [opencode](https://opencode.ai) (GLM, Kimi, DeepSeek, MiniMax…) — reviews **the same diff independently** under a different lens, then attacks the others' output: what did they *miss*, and which of their findings don't survive a refutation attempt. The output is a triaged findings report — fusion-review never touches your code.
 
 > **Status: v0.1, experimental.** Forked from [fusion](https://github.com/malakhov-dmitrii/fusion), whose harness (`fan` / `cross-verify` / `collect` / `cleanup`, the read-only sandboxing per CLI, the write-guard, the coverage discipline) this still is. The review playbook and the `judge` primitive are new and not yet battle-tested.
 
@@ -29,8 +29,10 @@ fan ──► model A  (correctness/concurrency)     ┐  every model sees the W
         model D  (tests/observability)         ┘  each ends with a REVIEWED: witness line
    │
    ▼
-normalize + dedupe   [SEV] axis file:line — суть — пруф   ← mechanical, on file:line.
-   │                 unparseable / proof-less lines are counted, not hidden
+triage               [SEV] axis file:line — суть — пруф   ← one command, no host judgement:
+   │                 clusters on (file, axis, line ±3), keeps the highest severity, preserves
+   │                 every raw wording, counts unparseable/proof-less lines instead of hiding
+   │                 them, and precomputes judge-plan.tsv (2 judges per finding, never authors)
    ▼
 cross-verify  (rotation — nobody grades themselves)
    asks for MISSED first, FALSE-POSITIVE second
@@ -46,7 +48,7 @@ report.md   confirmed · disputed · refuted   + a coverage block with every den
 
 Three invariants make it trustworthy:
 - **Union, not consensus.** A single-model finding is marked `sources: 1`, never dropped.
-- **No self-confirmation.** A model never judges its own finding — that's an echo, not verification.
+- **No self-confirmation.** A model never judges its own finding — that's an echo, not verification. `triage` computes the routing, so a host cannot get it wrong; both this and the dedupe are in the harness precisely because doing them by hand fails *invisibly*.
 - **Every number carries its denominator.** Not "found 5 bugs" but `5 confirmed / 23 raw · 4/4 participants ok · 12/12 files bundled · 3 unparsed`. A participant that returns nothing must prove it looked (`REVIEWED:` line) or it counts as an error, not as "clean".
 
 Write isolation is inherited from fusion: review is read-only, a git guard snapshots the repo before and after every fan, and a mutated tracked file stops the run (`write_leak: true`).
@@ -79,7 +81,7 @@ Everything is configured by environment variables — no config files:
 
 | Var | Meaning | Default |
 |---|---|---|
-| `FUSION_ROSTER` | participant list — **the roster `fan` runs** | none (unset → `fan` errors) |
+| `FUSION_REVIEW_ROSTER` | participant list — **the roster `fan` runs** | none, **no fallback** (unset → `fan` exits 96) |
 | `FUSION_MODEL_DEEPSEEK` | model for the `deepseek` alias | `opencode-go/deepseek-v4-pro` |
 | `FUSION_CLAUDE_EFFORT` | `--effort` for `claude` | CLI default |
 | `FUSION_GROK_EFFORT` | `--effort` for `grok` | CLI default |
@@ -87,16 +89,22 @@ Everything is configured by environment variables — no config files:
 | `FUSION_GUARD_REPO` | repo the write-guard watches | `$PWD` |
 | `FUSION_SCRATCH` | scratch dir for model writes | `/tmp/fusion-scratch` |
 
-Env var names keep the `FUSION_` prefix on purpose: if you run both fusion and fusion-review, one roster configures both.
+The roster variable is deliberately **separate from the planner's `$FUSION_ROSTER`, with no fallback**. Review fans N reviewers *and* ~2 judges per finding, so a roster you sized for planning silently turns into a much bigger and slower run here. A forgotten variable should cost you an error message, not a bill — so `fan` refuses to start rather than quietly borrowing the planner's list. The other `FUSION_*` names are shared on purpose: timeouts and model aliases mean the same thing in both tools.
 
-`fan` reads `$FUSION_ROSTER` itself when called with no participant arguments — prefer that over passing a list. Every `status.json` carries a `roster` block (`configured`, `matches_config`, `missing`, `unconfigured`); a run that doesn't match the configured ensemble prints `ROSTER-DRIFT`. The point is that `coverage.requested` alone can't tell you whether the ensemble was whole: its denominator comes from the caller, `roster.configured` comes from your config.
+A good review roster is small and diverse — two or three *different families* beat five variants of one:
+
+```bash
+export FUSION_REVIEW_ROSTER="grok opencode:zai-coding-plan/glm-5.2"
+```
+
+`fan` reads `$FUSION_REVIEW_ROSTER` itself when called with no participant arguments — prefer that over passing a list. Every `status.json` carries a `roster` block (`configured`, `matches_config`, `missing`, `unconfigured`); a run that doesn't match the configured ensemble prints `ROSTER-DRIFT`. The point is that `coverage.requested` alone can't tell you whether the ensemble was whole: its denominator comes from the caller, `roster.configured` comes from your config.
 
 > **Instruction isolation.** Grok's claude-compat scan would otherwise load the same `CLAUDE.md` the `claude` participant obeys — a *shared input blind spot*, the very thing an ensemble exists to avoid. `grok` runs with `GROK_CLAUDE_AGENTS_ENABLED=false` so the two families genuinely differ in what they read. The same reasoning is why reviewers never see each other's output before their round is sealed.
 
 A participant is `claude[:model]` · `codex` · `grok[:model]` · `opencode:<model>` · `deepseek` (alias). So you can run a **fully opencode-only** ensemble of three different families:
 
 ```bash
-export FUSION_ROSTER="opencode:opencode-go/glm-5 opencode:opencode-go/kimi-k2.7-code opencode:opencode-go/deepseek-v4-pro"
+export FUSION_REVIEW_ROSTER="opencode:opencode-go/glm-5 opencode:opencode-go/kimi-k2.7-code opencode:opencode-go/deepseek-v4-pro"
 ```
 
 ## Usage
@@ -110,8 +118,9 @@ export FUSION_ROSTER="opencode:opencode-go/glm-5 opencode:opencode-go/kimi-k2.7-
 Or drive the harness directly (no host needed):
 
 ```bash
-bash skills/fusion-review/review.sh fan review prompt.txt runs/r1        # roster from $FUSION_ROSTER
+bash skills/fusion-review/review.sh fan review prompt.txt runs/r1   # roster from $FUSION_REVIEW_ROSTER
 bash skills/fusion-review/review.sh cross-verify codex runs/r1/review/codex.md runs/r1
+bash skills/fusion-review/review.sh triage runs/r1                  # -> findings/ + judge-plan.tsv
 bash skills/fusion-review/review.sh judge grok runs/r1/findings/007.md runs/r1
 bash skills/fusion-review/review.sh collect runs/r1
 bash skills/fusion-review/review.sh --help

@@ -8,6 +8,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 Forked from [fusion](https://github.com/malakhov-dmitrii/fusion) and repurposed from planning to code review.
 
 ### Added
+- `triage <dir> [role]` — parses reviews, clusters findings on `(file, axis, line ±3)` keeping the highest reported severity and every participant's raw wording, and precomputes `judge-plan.tsv` with 2 **non-author** judges per finding. This is in the harness rather than the playbook because both steps fail *silently* when hand-done: a model asked to merge duplicates drops findings, and a judge routed to its own finding returns `real` from an echo — neither is visible in the output afterwards.
+- `$FUSION_REVIEW_ROSTER` — the roster, with **no fallback** to the planner's `$FUSION_ROSTER`. Review fans N reviewers *and* ~2 judges per finding, so borrowing a planner-sized roster would quietly multiply the cost of a run; unset now exits 96 instead.
 - `judge <participant> <finding-file> <dir>` — adversarial refutation of a single finding by a participant that did **not** author it. Three-way `VERDICT: real|refuted|uncertain`, because forcing a binary launders uncertain findings into confirmed ones or drops them silently.
 - `cross-verify` now takes an optional prompt file, so a one-off lens doesn't require editing the harness.
 - Shared finding contract (`FINDING_FMT` / `FINDING_AXES`): `[BLOCKER|MAJOR|MINOR] <axis> <file>:<line> — <суть> — <пруф>`. `file:line` is what lets the host dedupe mechanically instead of asking a model to merge duplicates (which drops findings).
