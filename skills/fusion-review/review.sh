@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# fusion.sh — minimal multi-model fan-out harness (v1).
-# Dumb pipe: fan / cross-verify / collect / cleanup. Orchestrator (any host) lives outside this script.
+# review.sh — minimal multi-model fan-out harness for CODE REVIEW.
+# Dumb pipe: fan / cross-verify / judge / spike / collect / cleanup. The orchestrator (any host)
+# lives outside this script.
+#
+# Lineage: forked from fusion (github.com/malakhov-dmitrii/fusion), whose harness this still is.
+# Harness fixes flow in from `upstream` via cherry-pick; the playbook (SKILL.md) is our own.
+# What differs from the planner: no consensus gate. A planner wants ONE agreed plan, so it makes
+# models converge. A reviewer wants the UNION of findings — model A catching what B missed is the
+# entire payoff of an ensemble, and converging would delete it. Consensus here applies per-finding
+# (does this survive refutation?), never to the finding SET. That is what `judge` is for.
 #
 # A participant is "<kind>[:<model>]":
 #   claude[:<model>]        -> claude -p [--model <model>]
@@ -140,25 +148,73 @@ cmd_fan() {
   [ "$leak" = true ] && return 3 || return 0
 }
 
-# cross-verify <verifier-participant> <target-plan-file> <dir> — idiot-test one plan
+# The finding format is the contract that makes the whole pipeline mechanical: `<file>:<line>`
+# gives the host a key to dedupe on, so merging N reviews never needs a model to "merge duplicates"
+# (which silently drops findings). Every stage that can emit a finding emits exactly this shape.
+FINDING_FMT='[BLOCKER|MAJOR|MINOR] <axis> <file>:<line> — <суть> — <пруф>'
+FINDING_AXES='correctness · security · perf · api-contract · tests · maintainability'
+
+# cross-verify <verifier> <target-review> <dir> [prompt-file] — idiot-test one participant's REVIEW.
+# The contract stays baked into the command by default (a host that re-composes the prompt each run
+# drifts it — this project has already observed exactly that failure with the roster), but an
+# explicit [prompt-file] allows a deliberate override for a one-off lens.
+# Note the asymmetry vs the planner: here the verifier is asked for MISSED findings first. Grading
+# the author's list only polices false positives; the expensive miss in review is the bug nobody saw.
 cmd_cross_verify() {
-  local verifier="$1" target="$2" dir="$3"
+  local verifier="$1" target="$2" dir="$3" custom="${4:-}"
+  _preflight || return 127
   mkdir -p "$dir/cross"
   local vslug; vslug="$(_slug "$verifier")"
   local base; base="$(basename "$target" .md)"
   local pf="$dir/cross/prompt-$vslug-on-$base.txt"
   {
-    echo "Ты — кросс-верификатор. Автор плана ниже НЕКОМПЕТЕНТЕН: перепроверь ИНСТРУМЕНТАЛЬНО"
-    echo "(grep/read/контрпример, не «перечитал и согласен»). Оси проверки:"
-    echo "correctness · completeness · assumptions · contradictions · missed-risks."
-    echo "Формат КАЖДОЙ находки ровно: [BLOCKER|MAJOR|MINOR] <axis> @<секция> — <суть> — <пруф>."
-    echo "Последняя строка ровно: VERDICT: verified|issues-found|blocked (blockers=<N>)."
-    echo "--- ПЛАН: ---"
+    if [ -n "$custom" ]; then
+      cat "$custom"
+    else
+      echo "Ты — кросс-верификатор код-ревью. Автор ревью ниже НЕКОМПЕТЕНТЕН в ОБЕ стороны:"
+      echo "он и ПРОПУСКАЕТ настоящие баги, и выдумывает несуществующие. Проверяй ИНСТРУМЕНТАЛЬНО"
+      echo "(открой файлы, найди вызывающих, построй контрпример), не «перечитал и согласен»."
+      echo "Выдай ДВА раздела:"
+      echo "1) MISSED — что автор не увидел в дифе. Это главная часть; оси: $FINDING_AXES."
+      echo "2) FALSE-POSITIVE — его находки, которые не выдерживают проверки, с пруфом почему."
+      echo "Формат КАЖДОЙ находки в MISSED ровно: $FINDING_FMT"
+      echo "Последняя строка ровно: VERDICT: verified|issues-found|blocked (missed=<N> fp=<N>)."
+      echo "--- РЕВЬЮ: ---"
+    fi
     cat "$target"
   } >"$pf"
   ( _timeout "$TIMEOUT" bash "$0" _run "$verifier" "$pf" \
       >"$dir/cross/$vslug-on-$base.md" 2>"$dir/cross/$vslug-on-$base.err"
     echo "$?" >"$dir/cross/$vslug-on-$base.exit" )
+}
+
+# judge <participant> <finding-file> <dir> — adversarially test ONE finding; prints its VERDICT.
+# The host MUST route a finding to a participant that did not produce it: a model grading its own
+# finding confirms it. The verdict is three-way on purpose — forcing a binary makes genuinely
+# uncertain findings get laundered into `real` or silently dropped, and in review both are bad.
+cmd_judge() {
+  local participant="$1" target="$2" dir="$3"
+  _preflight || return 127
+  mkdir -p "$dir/judge"
+  local pslug; pslug="$(_slug "$participant")"
+  local base; base="$(basename "$target" .md)"
+  local out="$dir/judge/$pslug-on-$base" rc
+  {
+    echo "Ты — состязательный судья ОДНОЙ находки код-ревью. Задача — попытаться её ОПРОВЕРГНУТЬ."
+    echo "Проверяй ИНСТРУМЕНТАЛЬНО: открой указанные файлы, найди вызывающих, построй конкретный"
+    echo "сценарий «вход/состояние -> наблюдаемый неверный результат». «Прочитал, выглядит верно» — не пруф."
+    echo "Опровергай, если: путь недостижим, инвариант держится выше по стеку, случай уже покрыт"
+    echo "проверкой/типом, поведение намеренное, или это стиль без последствий."
+    echo "Не занижай настоящий баг из вежливости и не подтверждай то, что не смог воспроизвести."
+    echo "Последняя строка РОВНО: VERDICT: real|refuted|uncertain — <пруф или чего не хватило>."
+    echo "--- НАХОДКА: ---"
+    cat "$target"
+  } >"$out.prompt.txt"
+  ( _timeout "$TIMEOUT" bash "$0" _run "$participant" "$out.prompt.txt" \
+      >"$out.md" 2>"$out.err" )
+  rc=$?
+  echo "$rc" >"$out.exit"
+  grep -E '^VERDICT:' "$out.md" 2>/dev/null || echo "VERDICT: uncertain — no verdict line (exit $rc)"
 }
 
 # collect <run-dir> — concat artifacts into aggregate.md
@@ -238,14 +294,16 @@ cmd_selftest() {
 
 _usage() {
   cat <<'USAGE'
-fusion.sh — minimal multi-model fan-out harness
+review.sh — minimal multi-model fan-out harness for code review
 
-  fan <role> <promptfile> <dir> <participant...>   run participants in parallel (write-guarded)
-  cross-verify <verifier> <target-plan> <dir>      idiot-test one plan
-  spike <hypothesis> <dir> [participant]           test an assumption in a throwaway worktree
-  collect <dir>                                    concat run artifacts into aggregate.md
-  selftest [participant]                           smoke the harness; PASS/FAIL
-  cleanup                                          remove orphan worktrees + scratch
+  fan <role> <promptfile> <dir> [participant...]      run participants in parallel (write-guarded;
+                                                      no args => roster from $FUSION_ROSTER)
+  cross-verify <verifier> <target-review> <dir> [pf]  idiot-test one review (missed + false-positive)
+  judge <participant> <finding-file> <dir>            adversarially refute ONE finding; prints VERDICT
+  spike <hypothesis> <dir> [participant]              reproduce a finding in a throwaway worktree
+  collect <dir>                                       concat run artifacts into aggregate.md
+  selftest [participant]                              smoke the harness; PASS/FAIL
+  cleanup                                             remove orphan worktrees + scratch
 
   participant = claude[:model] | codex | grok[:model] | opencode:<model> | deepseek
 USAGE
@@ -311,6 +369,7 @@ main() {
     _run)         _run "$@" ;;
     fan)          cmd_fan "$@" ;;
     cross-verify) cmd_cross_verify "$@" ;;
+    judge)        cmd_judge "$@" ;;
     spike)        cmd_spike "$@" ;;
     collect)      cmd_collect "$@" ;;
     selftest)     cmd_selftest "$@" ;;

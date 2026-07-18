@@ -1,0 +1,85 @@
+---
+name: fusion-review
+description: Multi-model adversarial code review — every model in your $FUSION_ROSTER independently reviews the same diff bundle under a different lens, cross-verifies what the others MISSED, and every surviving finding is routed to models that did not author it for adversarial refutation (real/refuted/uncertain). Output is a triaged findings report with coverage denominators; it never edits your code. Use when a diff is worth more than one model's blind spots — release branches, security-sensitive changes, unfamiliar subsystems.
+---
+
+# fusion-review — union-first, refutation-gated multi-model review
+
+Every model in `$FUSION_ROSTER` reviews **the same diff bundle independently**, then attacks each other's output. Premise: different model families have different blind spots, so the ensemble sees more than any one of them — **but only if the pipeline never asks them to agree on what to report.**
+
+**This is the one place fusion-review deliberately breaks from its parent, fusion.** The planner has a hard consensus gate because it must emit ONE plan. A reviewer must not: if model A finds a race that B and C missed, majority logic deletes exactly the finding you paid four models to get. So:
+
+> **Consensus applies per-finding, never to the finding set.** The set is a UNION. Each individual finding then has to survive adversarial refutation by models that did not author it.
+
+The orchestrator is the host model (Claude Code / Codex) running this playbook. It is not privileged: it does not decide what is a real bug, it routes and counts.
+
+## When to use
+A diff worth more than one model's blind spots — release branches, security-sensitive changes, concurrency, migrations, code in a subsystem you don't know well. **Not** for a two-line change or a style pass; it is a batch tool (minutes, N models × rounds). For a fast single-model pass use the host's own review command.
+
+## Invariants (never break)
+- **Union, not consensus.** Never drop a finding because only one participant raised it. Single-source findings are the ensemble's whole point; they are marked `sources: 1`, not deleted.
+- **No finding is confirmed by its author.** `judge` MUST route to participants that did not produce the finding. A model grading its own output confirms it — that is not verification, it is an echo.
+- **No finding without `file:line` + a proof.** The proof is instrumental: a concrete `вход/состояние -> наблюдаемый неверный результат`, a caller that violates the assumption, a counter-example. "Looks wrong" is dropped at normalization, not reported.
+- **Review whole files, never bare hunks.** A hunk that looks broken is routinely guarded 20 lines above it. Hunk-only context is the #1 manufacturer of false positives — the bundle carries the full text of every changed file.
+- **Every number travels with its denominator.** Never "found 5 bugs". Always `5 confirmed / 23 raw findings · 4/4 participants ok · 12/12 changed files bundled · 3 unparsed`. A count without its denominator hides whether you reviewed everything-and-it's-clean or 10%-and-that-10%-is-clean.
+- **Silence needs a denominator too.** A participant returning zero findings is either a clean diff or a lazy model, and they are indistinguishable without a witness. Every reviewer must end with `REVIEWED: <files> files, <hunks> hunks — findings=<k>`. Missing that line ⇒ the participant counts as `error`, not as "clean".
+- **`write_leak: true` → STOP.** Review is read-only; a participant mutating tracked files invalidates the run.
+- **`roster.matches_config: false` (ROSTER-DRIFT) → STOP.** Never expand the roster by hand — call `fan` with no participant args and let it read `$FUSION_ROSTER`. Host-substituted rosters are an observed failure in this lineage, and they corrupt `coverage.requested` so a third of the ensemble reports as full coverage.
+- **`<2` families available → `degraded`,** named as such in the report title, never presented as an ensemble review.
+- **Isolation by artifact location (Δ2).** Reviewers need live repo read-access, so they run with the repo as cwd; isolation comes from `$RUN` living **outside** the repo tree, so no participant sees another's review. Rounds seal read-only + shasum manifest the moment they end.
+
+## Parameters
+`/fusion-review --dir <repo> [--base <ref> | --pr <n>] [--depth lite|full]`
+`lite` = fan + judge (skip cross-verify). `full` = fan + cross-verify + judge (default).
+**Roster (`$FUSION_ROSTER`)** — participant = `claude[:model] | codex | grok[:model] | opencode:<model> | deepseek`.
+
+## Playbook
+
+Throughout: `export FUSION_GUARD_REPO=<target> FUSION_SCRATCH=/tmp/fr-$TS; RUN=$HOME/.fusion-review/runs/$(basename <target>)-$TS; SH=skills/fusion-review/review.sh`.
+
+### 0. Setup
+`bash "$SH" cleanup`; `mkdir -p $RUN`. `fan`/`judge`/`spike` preflight GNU `timeout` and refuse without it (macOS: `brew install coreutils`) — never let a missing harness read as "every model found nothing".
+
+### 1. Bundle the change (`$RUN/bundle.md`)
+- **Diff:** `git diff $(git merge-base <base> HEAD)..HEAD` — merge-base, never a two-dot diff against a moved base, or you review someone else's commits. `--pr <n>` → `gh pr diff <n>`. Default base: the repo's default branch.
+- **Full text of every changed file** (see the whole-files invariant). Depth-cap huge files, and say which were capped.
+- **Blast radius:** for every changed exported/public symbol, grep its callers and include them. A signature change is correct in its own file and broken at the call site.
+- **Context:** HEAD, branch, base ref, PR description if any, and the tests touching the changed files.
+- End with a **`## Files covered / Files NOT covered (and why)`** manifest. Anything skipped (vendored, generated, over cap) is named here, not silently omitted.
+
+### 2. Round 1 — fan review with lenses
+`$RUN/review-prompt.txt` = bundle + contract. Assign each participant a **lens** (prepended as one line; the lens biases attention, **every reviewer still sees the whole bundle** — a lens is not a shard):
+`correctness/concurrency` · `security/untrusted-input` · `api-contract/backward-compat` · `perf/resources` · `tests/observability`.
+The contract demands, for each finding, exactly `[BLOCKER|MAJOR|MINOR] <axis> <file>:<line> — <суть> — <пруф>`, and the closing `REVIEWED:` witness line.
+Also require the inverse pass — it catches what a bug-hunt frames out: **what the diff should have changed and didn't** (missed call site, unupdated test, doc/flag drift).
+`bash "$SH" fan review $RUN/review-prompt.txt $RUN` (no participant args — roster comes from env). `write_leak`→STOP. `<2 ok`→`degraded`.
+
+### 3. Normalize + dedupe (host, mechanical)
+Parse every finding line. Dedupe on `(file, line ±3, axis)`; merge attribution into `sources: [<participants>]`. Do **not** ask a model to merge duplicates — it drops findings.
+Unparseable or proof-less lines go to `$RUN/unparsed.md` and are **counted in the denominator**. Write one file per surviving finding: `$RUN/findings/<nnn>.md`.
+
+### 4. Cross-verify — MISSED first (skip if `--depth lite`)
+Rotation (i verifies i+1, nobody grades themselves): `bash "$SH" cross-verify <verifier> $RUN/review/<author>.md $RUN`.
+The baked contract asks for **MISSED before FALSE-POSITIVE** on purpose: grading the author's list only polices false positives, while the expensive miss in review is the bug nobody saw. New findings from this round re-enter step 3 **once** (no unbounded loop).
+
+### 5. Judge every finding (per-finding consensus)
+For each `$RUN/findings/<nnn>.md`, pick **2 participants that are not in its `sources`** and run `bash "$SH" judge <participant> $RUN/findings/<nnn>.md $RUN`. Verdicts are `real|refuted|uncertain`:
+- both `real` → **confirmed**; both `refuted` → **refuted**; anything else (incl. any `uncertain`) → **disputed**.
+- A `disputed` BLOCKER is worth one `bash "$SH" spike "reproduce <finding> and show the actual failure" $RUN <participant>` — a worktree repro settles it with evidence instead of opinion.
+- Roster too small to find 2 non-authors → use 1 and mark the finding `judged: 1/2 (degraded)`.
+
+### 6. Report (`$RUN/report.md`)
+Three sections, severity-ordered inside each: **Confirmed** · **Disputed** (with what would settle it) · **Refuted** (collapsed one-liners — kept, so a rejected finding isn't re-raised next run).
+Every entry: `file:line`, суть, пруф, `sources:`, `judged:`. Lead the report with the coverage block:
+`participants ok/requested · files bundled/changed · raw findings · deduped · confirmed/disputed/refuted · unparsed · decision ∈ {ensemble, degraded}`.
+State the base ref and HEAD you reviewed — a report without its git stamp is unreproducible.
+
+### 7. Learn
+Append a paragraph to review memory: which lens caught the highest-severity confirmed finding, which participant produced the most refuted findings (a noisy model is a roster decision), and any false-positive pattern worth adding to the contract. The next run's step 2 loads it.
+
+## Degraded / failures
+- timeout/exit≠0/empty → retry `fan` **into a fresh run dir or a new role name**; a sealed round is immutable (exit 95) and re-running into it would report `ok:0, degraded:true` while good drafts sit intact — a harness failure wearing a model failure's face.
+- Missing `REVIEWED:` witness → treat that participant as `error`, never as "reviewed, clean".
+- `ROSTER-DRIFT` → the run is not the configured ensemble. Re-run `fan` with no participant args. Dropping a participant is legitimate only when its CLI is missing/unauthenticated — and then it is `degraded`, named, never quiet.
+- Provider quota → drop it, recount coverage. 2 families → `degraded: two-model` (mutual cross-verify, judge falls back to 1/2). 1 family → `degraded: single-model`, `DEGRADED` in the report title — at that point this is a plain review, not an ensemble, and must not be sold as one.
+- Diff too large for one bundle → split **by directory/subsystem, never by hunk**, run one pass per split, and report per-split coverage. Splitting mid-file breaks the whole-files invariant.

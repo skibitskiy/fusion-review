@@ -1,63 +1,64 @@
-# fusion
+# fusion-review
 
-[![CI](https://github.com/malakhov-dmitrii/fusion/actions/workflows/ci.yml/badge.svg)](https://github.com/malakhov-dmitrii/fusion/actions/workflows/ci.yml)
+[![CI](https://github.com/skibitskiy/fusion-review/actions/workflows/ci.yml/badge.svg)](https://github.com/skibitskiy/fusion-review/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**A multi-model consensus planner for coding agents.** Every model you put in `$FUSION_ROSTER` — Claude, Codex, Grok, or anything you reach through [opencode](https://opencode.ai) (GLM, Kimi, DeepSeek, MiniMax…) — drafts a plan **independently**, cross-verify one another ("idiot-test"), and **must reach consensus** before a single plan is emitted. The output is a plan — fusion never touches your code.
+**Multi-model adversarial code review.** Every model you put in `$FUSION_ROSTER` — Claude, Codex, Grok, or anything you reach through [opencode](https://opencode.ai) (GLM, Kimi, DeepSeek, MiniMax…) — reviews **the same diff independently** under a different lens, then attacks the others' output: what did they *miss*, and which of their findings don't survive a refutation attempt. The output is a triaged findings report — fusion-review never touches your code.
 
-> **Status: v0.1, experimental.** The harness (`fan` / `cross-verify` / `collect` / `cleanup`) is verified working across Claude, Codex, and opencode (incl. an opencode-only roster of GLM + Kimi + DeepSeek), and the full `/fusion` cycle runs end-to-end. It's young — flags and ergonomics will change — but the core mechanism is the point, not a finished product.
+> **Status: v0.1, experimental.** Forked from [fusion](https://github.com/malakhov-dmitrii/fusion), whose harness (`fan` / `cross-verify` / `collect` / `cleanup`, the read-only sandboxing per CLI, the write-guard, the coverage discipline) this still is. The review playbook and the `judge` primitive are new and not yet battle-tested.
 
-## Why
+## Why not just consensus
 
-One frontier model has one set of blind spots. Three different model *families*, forced to debate and agree, cover for each other — the "fusion beats frontier" idea, applied to planning instead of answers. fusion makes the disagreement explicit and refuses to emit a plan until the models actually converge (or escalates the fork to you).
+fusion — the parent project — makes models **converge**, because a planner must emit one plan. Copying that into review is the mistake this repo exists to avoid:
 
-This is not a marginal quality bump. A single agent routinely hallucinates specifics — a flag, an API, a cost number — believes its own fiction, and ships something that does not work. The cross-verify rotation and the hard consensus gate exist to catch exactly that. fusion's own design and plan (in [`docs/`](docs/design)) were built this way, and the process caught real errors a solo agent had already written down as fact: a fabricated cost figure, a transport that did not survive a spike, a "read-only writes" contradiction, a missing `.gitignore`. That gap — between a grounded plan and confident fiction — is the whole point.
+> If model A finds a race that B and C missed, majority logic deletes exactly the finding you paid four models to get.
+
+So fusion-review inverts the gate. **The finding set is a UNION; consensus applies per-finding.** Every finding — including one raised by a single model — is then routed to models that *did not author it* and asked to refute it instrumentally. A finding is confirmed by surviving attack, not by being popular.
+
+The second failure mode is the opposite one: models inventing plausible bugs. That's what `judge` and the "no finding without `file:line` + a proof" rule are for. Both directions are policed; neither is policed by vote.
 
 ## How it works
 
 ```
-brief (raw repo context, not a Claude summary)
+bundle  (diff + FULL text of changed files + callers of changed symbols)
+   │       whole files, never bare hunks — a hunk that looks broken
+   ▼       is usually guarded 20 lines above it
+fan ──► model A  (correctness/concurrency)     ┐  every model sees the WHOLE bundle;
+        model B  (security/untrusted-input)    │  the lens biases attention, it does
+        model C  (api-contract/compat)         │  not shard the work
+        model D  (tests/observability)         ┘  each ends with a REVIEWED: witness line
    │
    ▼
-fan ──► model A  ┐
-        model B  │ every model in $FUSION_ROSTER drafts a full plan, independently,
-        model C  ┘ challenging "don't build it / simpler / depends on future / scenarios"
-   │
+normalize + dedupe   [SEV] axis file:line — суть — пруф   ← mechanical, on file:line.
+   │                 unparseable / proof-less lines are counted, not hidden
    ▼
 cross-verify  (rotation — nobody grades themselves)
-   A → B's plan,  B → C's,  C → A's
-   each re-checks every claim INSTRUMENTALLY (grep/read/counter-example)
+   asks for MISSED first, FALSE-POSITIVE second
    │
    ▼
-consensus gate  (hard: all agree on material axes, no majority override)
-   split survives → spike the assumption → re-discuss → operator breaks the tie
+judge  (per finding: 2 participants that are NOT its authors, told to REFUTE)
+   both real → confirmed · both refuted → refuted · anything else → disputed
+   disputed BLOCKER → spike: reproduce it in a throwaway worktree
    │
    ▼
-synthesize  → plan.md  (+ debate.md: who proposed what, how it resolved)
+report.md   confirmed · disputed · refuted   + a coverage block with every denominator
 ```
 
-Two invariants make it trustworthy:
-- **Hard consensus gate.** No plan is emitted until every available model agrees on the material axes (architecture, approach, key assumptions). A 2-of-3 majority never overrides a dissenter; an unresolved fork goes to you (`decision: operator_decision`), never silently averaged.
-- **Write isolation.** Planning is read-only. A git guard snapshots your repo before and after every fan; if a model mutates a tracked file, the run stops (`write_leak: true`).
+Three invariants make it trustworthy:
+- **Union, not consensus.** A single-model finding is marked `sources: 1`, never dropped.
+- **No self-confirmation.** A model never judges its own finding — that's an echo, not verification.
+- **Every number carries its denominator.** Not "found 5 bugs" but `5 confirmed / 23 raw · 4/4 participants ok · 12/12 files bundled · 3 unparsed`. A participant that returns nothing must prove it looked (`REVIEWED:` line) or it counts as an error, not as "clean".
 
-See a real run in [`examples/selftest-plan.md`](examples/selftest-plan.md).
+Write isolation is inherited from fusion: review is read-only, a git guard snapshots the repo before and after every fan, and a mutated tracked file stops the run (`write_leak: true`).
 
 ## Quickstart
 
 ```bash
-git clone https://github.com/malakhov-dmitrii/fusion fusion && cd fusion
+git clone https://github.com/skibitskiy/fusion-review && cd fusion-review
 ./install.sh                 # detects Claude Code / Codex, links the skill
 # authenticate the providers in your roster (below), then:
-/fusion <task> --dir <path-to-your-repo>
+/fusion-review --dir <path-to-your-repo> --base main
 ```
-
-## Installing with your coding agent
-
-Point your agent at this and it can install fusion itself:
-
-> Clone `https://github.com/malakhov-dmitrii/fusion`, run `./install.sh` from the repo root, then read `README.md` →
-> "Providers & auth" and make sure the CLIs for my chosen roster are authenticated.
-> Then set `FUSION_ROSTER` in my shell profile to the CLIs that authenticated. Confirm `/fusion` is available and report back.
 
 ## Requirements & providers
 
@@ -70,7 +71,7 @@ You only need the CLIs for the models in your roster.
 | Grok | [`grok`](https://grok.com) | `grok login` or `XAI_API_KEY` | `grok -p "say OK"` |
 | GLM / Kimi / DeepSeek / MiniMax… | [`opencode`](https://opencode.ai) | `opencode auth login` (OpenCode Go / OpenRouter) | `opencode run -m opencode-go/glm-5 "say OK"` |
 
-`git`, `bash`, `shasum` and GNU `timeout` (macOS: `brew install coreutils`) are assumed — fusion preflights `timeout` and refuses to run without it rather than reporting every participant as a model error. If a participant's CLI is missing or unauthenticated, fusion drops it and runs `degraded` (and labels the output as such — it won't pretend two models are three).
+`git`, `bash`, `shasum` and GNU `timeout` (macOS: `brew install coreutils`) are assumed — the harness preflights `timeout` and refuses to run without it, rather than letting a missing harness look exactly like "every model found nothing". If a participant's CLI is missing or unauthenticated it is dropped and the run is labelled `degraded` — it won't pretend two models are four.
 
 ## Models & rosters
 
@@ -80,17 +81,17 @@ Everything is configured by environment variables — no config files:
 |---|---|---|
 | `FUSION_ROSTER` | participant list — **the roster `fan` runs** | none (unset → `fan` errors) |
 | `FUSION_MODEL_DEEPSEEK` | model for the `deepseek` alias | `opencode-go/deepseek-v4-pro` |
-| `FUSION_MODEL_CLAUDE` | `--model` for `claude` | CLI default |
+| `FUSION_CLAUDE_EFFORT` | `--effort` for `claude` | CLI default |
 | `FUSION_GROK_EFFORT` | `--effort` for `grok` | CLI default |
 | `FUSION_TIMEOUT` | per-call timeout (s) | `300` |
 | `FUSION_GUARD_REPO` | repo the write-guard watches | `$PWD` |
 | `FUSION_SCRATCH` | scratch dir for model writes | `/tmp/fusion-scratch` |
 
-Set these in your shell profile (`~/.zshrc` / `~/.bashrc`) for a default roster, or prefix one run: `FUSION_ROSTER="…" /fusion …`.
+Env var names keep the `FUSION_` prefix on purpose: if you run both fusion and fusion-review, one roster configures both.
 
-`fan` reads `$FUSION_ROSTER` itself when called with no participant arguments — prefer that over passing a list. Every `status.json` carries a `roster` block (`configured`, `matches_config`, `missing`, `unconfigured`); if the run doesn't match the configured ensemble, fusion prints a `ROSTER-DRIFT` warning. The point is that `coverage.requested` alone can't tell you whether the ensemble was whole: its denominator comes from the caller, `roster.configured` comes from your config.
+`fan` reads `$FUSION_ROSTER` itself when called with no participant arguments — prefer that over passing a list. Every `status.json` carries a `roster` block (`configured`, `matches_config`, `missing`, `unconfigured`); a run that doesn't match the configured ensemble prints `ROSTER-DRIFT`. The point is that `coverage.requested` alone can't tell you whether the ensemble was whole: its denominator comes from the caller, `roster.configured` comes from your config.
 
-> **Instruction isolation.** Grok's claude-compat scan would otherwise load the same `CLAUDE.md` the `claude` participant obeys — a *shared input blind spot*, the very thing an ensemble exists to avoid. Fusion runs `grok` with `GROK_CLAUDE_AGENTS_ENABLED=false` so the two families genuinely differ in what they read.
+> **Instruction isolation.** Grok's claude-compat scan would otherwise load the same `CLAUDE.md` the `claude` participant obeys — a *shared input blind spot*, the very thing an ensemble exists to avoid. `grok` runs with `GROK_CLAUDE_AGENTS_ENABLED=false` so the two families genuinely differ in what they read. The same reasoning is why reviewers never see each other's output before their round is sealed.
 
 A participant is `claude[:model]` · `codex` · `grok[:model]` · `opencode:<model>` · `deepseek` (alias). So you can run a **fully opencode-only** ensemble of three different families:
 
@@ -101,37 +102,39 @@ export FUSION_ROSTER="opencode:opencode-go/glm-5 opencode:opencode-go/kimi-k2.7-
 ## Usage
 
 ```
-/fusion <task> --dir <target-repo> [--depth lite|full]
+/fusion-review --dir <target-repo> [--base <ref> | --pr <n>] [--depth lite|full]
 ```
+
+`full` (default) = fan + cross-verify + judge. `lite` = fan + judge, for when you want the union fast.
 
 Or drive the harness directly (no host needed):
 
 ```bash
-bash skills/fusion/fusion.sh fan draft prompt.txt runs/r1          # roster from $FUSION_ROSTER
-bash skills/fusion/fusion.sh cross-verify codex runs/r1/draft/codex.md runs/r1
-bash skills/fusion/fusion.sh collect runs/r1
-bash skills/fusion/fusion.sh --help
+bash skills/fusion-review/review.sh fan review prompt.txt runs/r1        # roster from $FUSION_ROSTER
+bash skills/fusion-review/review.sh cross-verify codex runs/r1/review/codex.md runs/r1
+bash skills/fusion-review/review.sh judge grok runs/r1/findings/007.md runs/r1
+bash skills/fusion-review/review.sh collect runs/r1
+bash skills/fusion-review/review.sh --help
 ```
 
-Artifacts land in `<target-repo>/.fusion/runs/<timestamp>/`: a `*-plan.md` (the consensus plan, with ranked assumptions and explicit operator-unknowns) and a `*-debate.md` (the trail).
+Artifacts land **outside** the reviewed repo, in `~/.fusion-review/runs/<repo>-<timestamp>/`. That's deliberate: reviewers run with live read-access to the repo, so in-tree artifacts would let one participant read another's review and turn an echo into fake corroboration.
 
 ## Works in Claude Code and Codex
 
-The harness is plain bash + CLI adapters, so the orchestrator host is interchangeable. `install.sh` links the skill into `~/.claude/skills/` (Claude Code, invoked as `/fusion`) and/or `~/.codex/skills/` (Codex reads `SKILL.md`). The only host-specific step is the operator interview — `AskUserQuestion` in Claude Code, a plain text question elsewhere.
-
-Claude Code can also load the repo as a plugin (the `.claude-plugin/plugin.json` manifest) via a plugin marketplace; the `install.sh` symlink is just the simplest path.
+The harness is plain bash + CLI adapters, so the orchestrator host is interchangeable. `install.sh` links the skill into `~/.claude/skills/` (Claude Code, invoked as `/fusion-review`) and/or `~/.codex/skills/` (Codex reads `SKILL.md`). The skill is named `fusion-review`, not `review`, to avoid colliding with hosts that ship their own `/review`.
 
 ## Limitations (read these)
 
-- **Plan-only.** fusion writes plans, never code. Hand the plan to an executor (e.g. `forge`, `improve execute`).
-- **Batch, not interactive.** A full run is multiple models × rounds — expect minutes, not seconds.
-- **Costs more than one model.** Several models × rounds — reach for it when being wrong is expensive (architecture, migrations, irreversible or hard-to-reverse calls), not for quick edits.
-- **Provider drift.** CLI flags and quotas change. Codex in particular has a usage quota and a strict `config.toml` (a bad `service_tier` will break `codex exec`).
+- **Report-only.** fusion-review never edits your code. Hand confirmed findings to an executor.
+- **Batch, not interactive.** N models × rounds — expect minutes. For a fast single-model pass, use your host's built-in review.
+- **Costs more than one model.** Reach for it when a missed bug is expensive — release branches, security-sensitive diffs, concurrency, migrations — not for every PR.
+- **Large diffs must be split** by directory/subsystem, never by hunk; splitting mid-file breaks the whole-files invariant that keeps false positives down.
+- **Provider drift.** CLI flags and quotas change. Codex in particular has a usage quota and a strict `config.toml`.
 
-## Internals & design
+## Lineage
 
-The full design, the decision log, and the implementation plan (themselves produced and reviewed *through fusion*) live in [`docs/design/`](docs/design).
+Forked from [malakhov-dmitrii/fusion](https://github.com/malakhov-dmitrii/fusion). The harness is shared ancestry and harness fixes are cherry-picked from `upstream`; the review playbook, the `judge` primitive, and the union-over-consensus gate are this repo's. The parent's design docs — which explain why the harness looks the way it does — are kept in [`docs/lineage/`](docs/lineage); they describe the *planner*, not this tool.
 
 ## License
 
-MIT © Dmitrii Malakhov
+MIT © Dmitrii Malakhov (upstream fusion) · MIT © skibitskiy (fusion-review)
