@@ -1,11 +1,11 @@
 ---
 name: fusion-review
-description: Multi-model adversarial code review — every model in your $FUSION_ROSTER independently reviews the same diff bundle under a different lens, cross-verifies what the others MISSED, and every surviving finding is routed to models that did not author it for adversarial refutation (real/refuted/uncertain). Output is a triaged findings report with coverage denominators; it never edits your code. Use when a diff is worth more than one model's blind spots — release branches, security-sensitive changes, unfamiliar subsystems.
+description: Multi-model adversarial code review — every model in your $FUSION_REVIEW_ROSTER independently reviews the same diff bundle under a different lens, cross-verifies what the others MISSED, and every surviving finding is routed to models that did not author it for adversarial refutation (real/refuted/uncertain). Output is a triaged findings report with coverage denominators; it never edits your code. Use when a diff is worth more than one model's blind spots — release branches, security-sensitive changes, unfamiliar subsystems.
 ---
 
 # fusion-review — union-first, refutation-gated multi-model review
 
-Every model in `$FUSION_ROSTER` reviews **the same diff bundle independently**, then attacks each other's output. Premise: different model families have different blind spots, so the ensemble sees more than any one of them — **but only if the pipeline never asks them to agree on what to report.**
+Every model in `$FUSION_REVIEW_ROSTER` reviews **the same diff bundle independently**, then attacks each other's output. Premise: different model families have different blind spots, so the ensemble sees more than any one of them — **but only if the pipeline never asks them to agree on what to report.**
 
 **This is the one place fusion-review deliberately breaks from its parent, fusion.** The planner has a hard consensus gate because it must emit ONE plan. A reviewer must not: if model A finds a race that B and C missed, majority logic deletes exactly the finding you paid four models to get. So:
 
@@ -24,14 +24,15 @@ A diff worth more than one model's blind spots — release branches, security-se
 - **Every number travels with its denominator.** Never "found 5 bugs". Always `5 confirmed / 23 raw findings · 4/4 participants ok · 12/12 changed files bundled · 3 unparsed`. A count without its denominator hides whether you reviewed everything-and-it's-clean or 10%-and-that-10%-is-clean.
 - **Silence needs a denominator too.** A participant returning zero findings is either a clean diff or a lazy model, and they are indistinguishable without a witness. Every reviewer must end with `REVIEWED: <files> files, <hunks> hunks — findings=<k>`. Missing that line ⇒ the participant counts as `error`, not as "clean".
 - **`write_leak: true` → STOP.** Review is read-only; a participant mutating tracked files invalidates the run.
-- **`roster.matches_config: false` (ROSTER-DRIFT) → STOP.** Never expand the roster by hand — call `fan` with no participant args and let it read `$FUSION_ROSTER`. Host-substituted rosters are an observed failure in this lineage, and they corrupt `coverage.requested` so a third of the ensemble reports as full coverage.
+- **`roster.matches_config: false` (ROSTER-DRIFT) → STOP.** Never expand the roster by hand — call `fan` with no participant args and let it read `$FUSION_REVIEW_ROSTER`. Host-substituted rosters are an observed failure in this lineage, and they corrupt `coverage.requested` so a third of the ensemble reports as full coverage.
+- **Never hand-roll triage or judge routing.** `triage` does the parse, the dedupe, and the author-exclusion. Both hand-done steps fail *silently* — a model asked to merge duplicates drops findings, and a judge routed to its own finding returns `real` from an echo — and neither is visible in the output afterwards.
 - **`<2` families available → `degraded`,** named as such in the report title, never presented as an ensemble review.
 - **Isolation by artifact location (Δ2).** Reviewers need live repo read-access, so they run with the repo as cwd; isolation comes from `$RUN` living **outside** the repo tree, so no participant sees another's review. Rounds seal read-only + shasum manifest the moment they end.
 
 ## Parameters
 `/fusion-review --dir <repo> [--base <ref> | --pr <n>] [--depth lite|full]`
 `lite` = fan + judge (skip cross-verify). `full` = fan + cross-verify + judge (default).
-**Roster (`$FUSION_ROSTER`)** — participant = `claude[:model] | codex | grok[:model] | opencode:<model> | deepseek`.
+**Roster (`$FUSION_REVIEW_ROSTER`)** — participant = `claude[:model] | codex | grok[:model] | opencode:<model> | deepseek`. It has **no fallback** to the planner's `$FUSION_ROSTER`: review fans N reviewers *and* ~2 judges per finding, so a planner-sized roster silently becomes a far bigger run. Unset ⇒ `fan` refuses (exit 96).
 
 ## Playbook
 
@@ -54,19 +55,19 @@ The contract demands, for each finding, exactly `[BLOCKER|MAJOR|MINOR] <axis> <f
 Also require the inverse pass — it catches what a bug-hunt frames out: **what the diff should have changed and didn't** (missed call site, unupdated test, doc/flag drift).
 `bash "$SH" fan review $RUN/review-prompt.txt $RUN` (no participant args — roster comes from env). `write_leak`→STOP. `<2 ok`→`degraded`.
 
-### 3. Normalize + dedupe (host, mechanical)
-Parse every finding line. Dedupe on `(file, line ±3, axis)`; merge attribution into `sources: [<participants>]`. Do **not** ask a model to merge duplicates — it drops findings.
-Unparseable or proof-less lines go to `$RUN/unparsed.md` and are **counted in the denominator**. Write one file per surviving finding: `$RUN/findings/<nnn>.md`.
+### 3. Triage (`bash "$SH" triage $RUN`)
+One command, no host judgement: it parses every finding line, clusters on `(file, axis, line ±3)` keeping the highest reported severity and preserving each participant's raw wording, writes `$RUN/findings/<nnn>.md` with a `sources:` header, sends unparseable or proof-less lines to `$RUN/unparsed.md`, and precomputes `$RUN/judge-plan.tsv` (2 non-author judges per finding).
+It prints `raw=… deduped=… unparsed=… judge-pairs=… under-judged=… roster=…` — carry those numbers into the report's coverage block verbatim. `under-judged>0` means the roster was too small to find 2 non-authors for some finding; those are `judged: 1/2 (degraded)`.
 
 ### 4. Cross-verify — MISSED first (skip if `--depth lite`)
 Rotation (i verifies i+1, nobody grades themselves): `bash "$SH" cross-verify <verifier> $RUN/review/<author>.md $RUN`.
-The baked contract asks for **MISSED before FALSE-POSITIVE** on purpose: grading the author's list only polices false positives, while the expensive miss in review is the bug nobody saw. New findings from this round re-enter step 3 **once** (no unbounded loop).
+The baked contract asks for **MISSED before FALSE-POSITIVE** on purpose: grading the author's list only polices false positives, while the expensive miss in review is the bug nobody saw. New findings from this round re-enter step 3 **once** — re-run `triage` with the cross round included (no unbounded loop).
 
 ### 5. Judge every finding (per-finding consensus)
-For each `$RUN/findings/<nnn>.md`, pick **2 participants that are not in its `sources`** and run `bash "$SH" judge <participant> $RUN/findings/<nnn>.md $RUN`. Verdicts are `real|refuted|uncertain`:
+Execute `$RUN/judge-plan.tsv` — each row is `<finding-id>\t<participant>`, already filtered so no participant judges its own finding: `bash "$SH" judge <participant> $RUN/findings/<id>.md $RUN`. Run the rows in parallel; each prints its verdict. Verdicts are `real|refuted|uncertain`:
 - both `real` → **confirmed**; both `refuted` → **refuted**; anything else (incl. any `uncertain`) → **disputed**.
 - A `disputed` BLOCKER is worth one `bash "$SH" spike "reproduce <finding> and show the actual failure" $RUN <participant>` — a worktree repro settles it with evidence instead of opinion.
-- Roster too small to find 2 non-authors → use 1 and mark the finding `judged: 1/2 (degraded)`.
+- `triage` already flagged findings with fewer than 2 non-author judges; mark those `judged: 1/2 (degraded)`. Never top up with an author to reach two.
 
 ### 6. Report (`$RUN/report.md`)
 Three sections, severity-ordered inside each: **Confirmed** · **Disputed** (with what would settle it) · **Refuted** (collapsed one-liners — kept, so a rejected finding isn't re-raised next run).
