@@ -25,6 +25,12 @@ jobs:
       - name: Usage smoke
         run: bash skills/fusion-review/review.sh --help | grep -q 'fan <role>'
 
+      # The four checks above (syntax, shellcheck, --help grep, install idempotency) were all green
+      # while triage was dropping findings from both denominators and routing findings back to their
+      # own author. Behaviour has to be asserted, not linted. Fixture-only: no model CLI, no network.
+      - name: Triage regression tests
+        run: bash tests/triage-test.sh
+
       - name: install.sh is idempotent
         run: |
           mkdir -p "$HOME/.claude"   # simulate a host so the linker has a target

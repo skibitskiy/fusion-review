@@ -10,4 +10,4 @@ labels: enhancement
 **Proposed change**
 
 **Keep it minimal?**
-<!-- fusion stays small: does this belong in fusion.sh (mechanical) or SKILL.md (playbook)? -->
+<!-- fusion stays small: does this belong in review.sh (mechanical) or SKILL.md (playbook)? -->

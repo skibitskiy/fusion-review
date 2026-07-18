@@ -29,12 +29,14 @@ fi
 
 echo
 echo "Model CLIs (install only the ones in your roster):"
-for c in claude codex opencode; do
+for c in claude codex grok opencode; do
   if command -v "$c" >/dev/null 2>&1; then echo "  ✓ $c"; else echo "  – $c  (optional)"; fi
 done
 
 echo
 echo "Next:"
-echo "  1. Authenticate the providers you'll use (README → Providers & auth)."
-echo "  2. Pick a roster (README → Models & rosters); default is: claude codex deepseek"
+echo "  1. Authenticate the providers you'll use (README → Requirements & providers)."
+echo "  2. Set a roster — there is NO default, and no fallback to the planner's \$FUSION_ROSTER."
+echo "     Unset ⇒ 'fan' refuses to run (exit 96), so a forgotten variable costs an error, not a bill."
+echo "     e.g.  export FUSION_REVIEW_ROSTER=\"grok opencode:zai-coding-plan/glm-5.2\""
 echo "  3. Run:  /fusion-review --dir <repo>       (or: bash skills/fusion-review/review.sh --help)"

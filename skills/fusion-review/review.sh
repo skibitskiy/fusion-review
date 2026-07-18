@@ -33,6 +33,26 @@ FUSION_OC_READONLY='{"permission":{"edit":"deny","bash":"deny"}}'
 
 _slug() { printf '%s' "$1" | tr '/:' '__'; }   # participant -> safe filename
 
+# _count <file> — number of non-empty lines, as ONE clean integer.
+# `$(grep -c . f || echo 0)` is a trap: on an empty file grep PRINTS 0 and EXITS 1, so the fallback
+# fires too and the substitution captures "0\n0". Those counters are the product headline claim
+# ("raw=N deduped=N unparsed=N"), and they were printing embedded newlines on every empty run.
+_count() { local n; n="$(grep -c . "$1" 2>/dev/null)"; [ -n "$n" ] || n=0; printf '%s' "$n"; }
+
+# _is_source <candidate> <"a, b, c"> — exact whole-entry membership. Never substring: `grok` must
+# not match `grok-4.5`, and `claude` must not match `claude:opus`.
+_is_source() {
+  local cand="$1" rest="$2" item
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *", "*) item="${rest%%, *}"; rest="${rest#*, }" ;;
+      *)      item="$rest"; rest="" ;;
+    esac
+    [ "$item" = "$cand" ] && return 0
+  done
+  return 1
+}
+
 # _roster — the roster, from $FUSION_REVIEW_ROSTER only. Deliberately NO fallback to the planner's
 # $FUSION_ROSTER: review fans N reviewers AND ~2 judges per finding, so a roster sized for planning
 # silently turns into a much bigger, slower, more expensive run here. A forgotten variable must fail
@@ -132,6 +152,12 @@ cmd_fan() {
   sig_before="$(_repo_sig)"
   for p in "$@"; do
     slug="$(_slug "$p")"
+    # Identity sidecar: _slug is LOSSY and one-way ('opencode:zai/glm-5.2' -> 'opencode_zai_glm-5.2'),
+    # so downstream stages that recovered a participant from a filename were guessing. triage then
+    # compared those guesses against roster strings, failed to match, and routed findings back to
+    # their own author — a model confirming its own finding, with nothing in the output revealing it.
+    # Writing the participant string verbatim makes identity explicit instead of inferred.
+    printf '%s\n' "$p" >"$dir/$role/$slug.author"
     ( _timeout "$TIMEOUT" bash "$0" _run "$p" "$prompt" \
         >"$dir/$role/$slug.md" 2>"$dir/$role/$slug.err"
       echo "$?" >"$dir/$role/$slug.exit" ) &
@@ -191,6 +217,10 @@ cmd_cross_verify() {
     fi
     cat "$target"
   } >"$pf"
+  # The AUTHOR of a cross-verify artifact is the VERIFIER, not the review it examined. The filename
+  # ('grok-on-opencode_glm.md') encodes both and is unparseable back into either, so triage used to
+  # read the whole compound as one identity — which is why `grok` could be handed a finding it wrote.
+  printf '%s\n' "$verifier" >"$dir/cross/$vslug-on-$base.author"
   ( _timeout "$TIMEOUT" bash "$0" _run "$verifier" "$pf" \
       >"$dir/cross/$vslug-on-$base.md" 2>"$dir/cross/$vslug-on-$base.err"
     echo "$?" >"$dir/cross/$vslug-on-$base.exit" )
@@ -311,34 +341,71 @@ cmd_selftest() {
 # Both are unfalsifiable after the fact, which is the same shape as the roster drift this project
 # already got burned by. So: mechanical step, mechanical implementation.
 cmd_triage() {
-  local dir="$1" role="${2:-review}"
-  local rd="$dir/$role" raw="$dir/findings.tsv" un="$dir/unparsed.md" fdir="$dir/findings"
-  [ -d "$rd" ] || { echo "triage: no round dir $rd" >&2; return 94; }
+  local dir="$1"; shift || true
+  # MULTIPLE roles in ONE pass. This used to take a single role and `rm -rf` the findings dir on
+  # every call, so the documented two-step (`triage $d` then `triage $d cross`) silently DELETED the
+  # review round's findings and left only cross's. Clearing findings/ is still correct — but only
+  # because one pass now rebuilds from every named role, so no round can be lost by naming them
+  # one at a time.
+  local roles="$*" r
+  if [ -z "$roles" ]; then
+    roles="review"
+    [ -d "$dir/cross" ] && roles="review cross"
+  fi
+  for r in $roles; do
+    [ -d "$dir/$r" ] || { echo "triage: no round dir $dir/$r" >&2; return 94; }
+  done
+  local raw="$dir/findings.tsv" un="$dir/unparsed.md" fdir="$dir/findings"
   rm -rf "$fdir"; mkdir -p "$fdir"; : >"$raw"; : >"$un"
-  local f p
-  for f in "$rd"/*.md; do
-    [ -f "$f" ] || continue
-    p="$(basename "$f" .md)"
-    # A finding is `[SEV] axis file:line — gist — proof`. A line missing the location or the proof
-    # is NOT downgraded into a vague finding — it goes to unparsed.md and stays in the denominator.
-    awk -v P="$p" -v UN="$un" '
-      function trim(x){ sub(/^[ \t]+/,"",x); sub(/[ \t]+$/,"",x); return x }
-      {
-        line=$0
-        sub(/^[ \t]*[-*][ \t]*/,"",line)               # tolerate a markdown bullet
-        if (line !~ /^\[(BLOCKER|MAJOR|MINOR)\]/) next
-        split(line,t,/[ \t]+/)
-        sev=t[1]; gsub(/[][]/,"",sev); axis=t[2]; loc=t[3]
-        if (match(loc,/:[0-9]+$/)==0) { print line >> UN; next }
-        file=substr(loc,1,RSTART-1); ln=substr(loc,RSTART+1)+0
-        body=substr(line, index(line,loc)+length(loc))
-        if (gsub(/—|--/,"@@S@@",body) < 2) { print line >> UN; next }   # no proof section
-        split(body,b,"@@S@@")
-        gist=trim(b[2]); proof=trim(b[3])
-        if (file=="" || ln<=0 || gist=="" || proof=="") { print line >> UN; next }
-        gsub(/\t/," ",gist); gsub(/\t/," ",proof)
-        printf "%s\t%d\t%s\t%s\t%s\t%s\t%s\n", file, ln, axis, sev, P, gist, proof
-      }' "$f" >>"$raw"
+  local f p observed=""
+  for r in $roles; do
+    for f in "$dir/$r"/*.md; do
+      [ -f "$f" ] || continue
+      # Identity comes from the sidecar written by fan/cross-verify; the basename is only a
+      # fallback for artifacts produced before sidecars existed.
+      p=""
+      [ -f "${f%.md}.author" ] && p="$(cat "${f%.md}.author" 2>/dev/null)"
+      [ -n "$p" ] || p="$(basename "$f" .md)"
+      case " $observed " in *" $p "*) ;; *) observed="$observed${observed:+ }$p" ;; esac
+      # A finding is `[SEV] axis file:line — gist — proof`. A line missing the location or the proof
+      # is NOT downgraded into a vague finding — it goes to unparsed.md and stays in the denominator.
+      awk -v P="$p" -v UN="$un" -v D='—' '
+        function trim(x){ sub(/^[ \t]+/,"",x); sub(/[ \t]+$/,"",x); return x }
+        {
+          line=$0
+          # Strip leading whitespace FIRST, then an optional bullet, then any space after it.
+          # The old order stripped only a bullet, so an indented finding failed the ^\[ test and
+          # hit `next` — vanishing from findings AND from unparsed, i.e. from both denominators.
+          # A tool whose headline claim is its denominators cannot silently drop lines.
+          sub(/^[ \t]+/,"",line)
+          sub(/^[-*][ \t]*/,"",line)
+          sub(/^[ \t]+/,"",line)
+          # "finding-shaped" = starts with a severity tag. Shaped-but-broken MUST reach unparsed.md;
+          # prose is skipped silently and counted nowhere (inflating unparsed with prose would make
+          # the number useless as a parse-failure signal).
+          if (line !~ /^\[(BLOCKER|MAJOR|MINOR)\]/) next
+          split(line,t,/[ \t]+/)
+          sev=t[1]; gsub(/[][]/,"",sev); axis=t[2]; loc=t[3]
+          # Accept file:<n> and file:<n>-<m>; a range is a legitimate location, and rejecting it
+          # dumped real findings into unparsed. The FIRST number is the line.
+          if (match(loc,/:[0-9]+(-[0-9]+)?$/)==0) { print line >> UN; next }
+          file=substr(loc,1,RSTART-1); ln=substr(loc,RSTART+1)+0
+          body=substr(line, index(line,loc)+length(loc))
+          # The separator is the em-dash ONLY. Treating `--` as a separator corrupted every finding
+          # about a CLI flag: "ignores --readonly — flag treated as path" parsed as gist="ignores",
+          # proof="readonly". Split on the first TWO em-dashes and give the proof EVERYTHING after
+          # the second, so em-dashes inside a proof survive verbatim.
+          p1=index(body,D)
+          if (p1==0) { print line >> UN; next }
+          rest=substr(body,p1+length(D))
+          p2=index(rest,D)
+          if (p2==0) { print line >> UN; next }
+          gist=trim(substr(rest,1,p2-1)); proof=trim(substr(rest,p2+length(D)))
+          if (file=="" || ln<=0 || gist=="" || proof=="") { print line >> UN; next }
+          gsub(/\t/," ",gist); gsub(/\t/," ",proof)
+          printf "%s\t%d\t%s\t%s\t%s\t%s\t%s\n", file, ln, axis, sev, P, gist, proof
+        }' "$f" >>"$raw"
+    done
   done
 
   # Cluster on (file, axis, line within 3) — two models describing one bug rarely agree on the exact
@@ -358,14 +425,26 @@ cmd_triage() {
     }
     {
       key=$1 "\t" $3
-      if (key!=ck || $2-lastline>3) { flush(); ck=key; cfile=$1; caxis=$3; bline=$2; bsev=$4; bgist=$6; bproof=$7 }
-      lastline=$2
+      # Distance from the CLUSTER START, not from the previous row. Chaining off the previous row
+      # let each successive +3 gap extend the window without bound: lines 10,13,16,19,22 collapsed
+      # into ONE finding while the docs promise ±3. That merges unrelated bugs and the merge is
+      # invisible afterwards. 10,13,14 still cluster; 16 no longer joins a cluster that starts at 10.
+      if (key!=ck || $2-cstart>3) { flush(); ck=key; cstart=$2; cfile=$1; caxis=$3; bline=$2; bsev=$4; bgist=$6; bproof=$7 }
       if (rank($4)>rank(bsev)) { bsev=$4; bline=$2; bgist=$6; bproof=$7 }
       dup=0; for(i=1;i<=ns;i++) if(src[i]==$5) dup=1
       if(!dup) src[++ns]=$5
-      var[++nv]=sprintf("[%s] %s:%d (%s) — %s", $4, $1, $2, $5, $6)
+      # Keep gist AND proof: dropping $7 threw away the evidence each participant supplied, while
+      # the changelog claims every participant wording is preserved under the merged finding.
+      var[++nv]=sprintf("[%s] %s:%d (%s) — %s — %s", $4, $1, $2, $5, $6, $7)
     }
     END { flush() }'
+
+  # Candidate judges: the configured roster when there is one, otherwise the participants actually
+  # observed via the .author sidecars. With an unset $FUSION_REVIEW_ROSTER the pool used to be empty,
+  # so a perfectly good `fan <dir> claude codex` produced an EMPTY judge-plan.tsv and 0/2 on every
+  # finding — the harness reported no judges available for participants it had just run itself.
+  local candidates; candidates="$(_roster)"
+  [ -n "$candidates" ] || candidates="$observed"
 
   # Judge routing: 2 participants per finding, NEVER one of its sources (see the header comment).
   local fn id srcs c chosen short=0
@@ -375,8 +454,12 @@ cmd_triage() {
     id="$(basename "$fn" .md)"
     srcs="$(awk -F'sources: ' '/^sources: /{print $2; exit}' "$fn")"
     chosen=0
-    for c in $(_roster); do
-      case ",$(printf '%s' "$srcs" | tr -d ' ')," in *",$(_slug "$c"),"*) continue ;; esac
+    for c in $candidates; do
+      # Whole-entry comparison of participant STRINGS. The old test slugged the candidate and
+      # substring-matched it against a comma-joined blob, which failed both ways: it never matched
+      # a compound cross-verify basename (so a model judged its own finding), and a substring test
+      # would wrongly exclude `grok` whenever `grok-4.5` was a source.
+      _is_source "$c" "$srcs" && continue
       printf '%s\t%s\n' "$id" "$c" >>"$dir/judge-plan.tsv"
       chosen=$((chosen+1)); [ "$chosen" -ge 2 ] && break
     done
@@ -384,11 +467,13 @@ cmd_triage() {
   done
 
   local n_raw n_find n_un n_pair
-  n_raw="$(grep -c . "$raw" 2>/dev/null || echo 0)"
-  n_un="$(grep -c . "$un" 2>/dev/null || echo 0)"
+  n_raw="$(_count "$raw")"
+  n_un="$(_count "$un")"
   n_find="$(find "$fdir" -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
-  n_pair="$(grep -c . "$dir/judge-plan.tsv" 2>/dev/null || echo 0)"
-  echo "triage: raw=$n_raw deduped=$n_find unparsed=$n_un judge-pairs=$n_pair under-judged=$short roster=$(_roster | wc -w | tr -d ' ')"
+  n_pair="$(_count "$dir/judge-plan.tsv")"
+  # roles= stays LAST: it is the only free-form field (it can hold several space-separated roles),
+  # so every key=value counter ahead of it remains trivially parseable.
+  echo "triage: raw=$n_raw deduped=$n_find unparsed=$n_un judge-pairs=$n_pair under-judged=$short candidates=$(printf '%s' "$candidates" | wc -w | tr -d ' ') roles=$roles"
 }
 
 _usage() {
@@ -398,7 +483,8 @@ review.sh — minimal multi-model fan-out harness for code review
   fan <role> <promptfile> <dir> [participant...]      run participants in parallel (write-guarded;
                                                       no args => roster from $FUSION_REVIEW_ROSTER)
   cross-verify <verifier> <target-review> <dir> [pf]  idiot-test one review (missed + false-positive)
-  triage <dir> [role]                                 parse+dedupe reviews -> findings/ + judge-plan.tsv
+  triage <dir> [role...]                              parse+dedupe reviews -> findings/ + judge-plan.tsv
+                                                      (all roles in ONE pass; default: review [+ cross])
   judge <participant> <finding-file> <dir>            adversarially refute ONE finding; prints VERDICT
   spike <hypothesis> <dir> [participant]              reproduce a finding in a throwaway worktree
   collect <dir>                                       concat run artifacts into aggregate.md

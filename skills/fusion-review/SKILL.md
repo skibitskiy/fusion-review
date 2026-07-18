@@ -1,6 +1,6 @@
 ---
 name: fusion-review
-description: Multi-model adversarial code review — every model in your $FUSION_REVIEW_ROSTER independently reviews the same diff bundle under a different lens, cross-verifies what the others MISSED, and every surviving finding is routed to models that did not author it for adversarial refutation (real/refuted/uncertain). Output is a triaged findings report with coverage denominators; it never edits your code. Use when a diff is worth more than one model's blind spots — release branches, security-sensitive changes, unfamiliar subsystems.
+description: Multi-model adversarial code review — every model in your $FUSION_REVIEW_ROSTER independently reviews the same diff bundle against the same set of lenses, cross-verifies what the others MISSED, and every surviving finding is routed to models that did not author it for adversarial refutation (real/refuted/uncertain). Output is a triaged findings report with coverage denominators; it never edits your code. Use when a diff is worth more than one model's blind spots — release branches, security-sensitive changes, unfamiliar subsystems.
 ---
 
 # fusion-review — union-first, refutation-gated multi-model review
@@ -48,26 +48,31 @@ Throughout: `export FUSION_GUARD_REPO=<target> FUSION_SCRATCH=/tmp/fr-$TS; RUN=$
 - **Context:** HEAD, branch, base ref, PR description if any, and the tests touching the changed files.
 - End with a **`## Files covered / Files NOT covered (and why)`** manifest. Anything skipped (vendored, generated, over cap) is named here, not silently omitted.
 
-### 2. Round 1 — fan review with lenses
-`$RUN/review-prompt.txt` = bundle + contract. Assign each participant a **lens** (prepended as one line; the lens biases attention, **every reviewer still sees the whole bundle** — a lens is not a shard):
+### 2. Round 1 — fan review across the lens axes
+`$RUN/review-prompt.txt` = bundle + contract. The prompt names **all** the lens axes and asks every reviewer to cover each one:
 `correctness/concurrency` · `security/untrusted-input` · `api-contract/backward-compat` · `perf/resources` · `tests/observability`.
+**Per-participant lenses are not supported.** `fan` takes ONE prompt file and sends the identical text to every participant — there is no per-participant prompt and no flag for one, so do not try to hand model A a different lens line than model B. Diversity here comes from the model families differing, not from the prompt differing; the shared axis list is what stops a family's blind spot from becoming the ensemble's.
 The contract demands, for each finding, exactly `[BLOCKER|MAJOR|MINOR] <axis> <file>:<line> — <суть> — <пруф>`, and the closing `REVIEWED:` witness line.
 Also require the inverse pass — it catches what a bug-hunt frames out: **what the diff should have changed and didn't** (missed call site, unupdated test, doc/flag drift).
 `bash "$SH" fan review $RUN/review-prompt.txt $RUN` (no participant args — roster comes from env). `write_leak`→STOP. `<2 ok`→`degraded`.
 
-### 3. Triage (`bash "$SH" triage $RUN`)
-One command, no host judgement: it parses every finding line, clusters on `(file, axis, line ±3)` keeping the highest reported severity and preserving each participant's raw wording, writes `$RUN/findings/<nnn>.md` with a `sources:` header, sends unparseable or proof-less lines to `$RUN/unparsed.md`, and precomputes `$RUN/judge-plan.tsv` (2 non-author judges per finding).
-It prints `raw=… deduped=… unparsed=… judge-pairs=… under-judged=… roster=…` — carry those numbers into the report's coverage block verbatim. `under-judged>0` means the roster was too small to find 2 non-authors for some finding; those are `judged: 1/2 (degraded)`.
+### 3. Triage (`bash "$SH" triage $RUN [role...]`)
+One command, no host judgement: it parses every finding line, clusters on `(file, axis, line within +3 of the FIRST line in the cluster)` keeping the highest reported severity and preserving each participant's raw gist *and* proof, writes `$RUN/findings/<nnn>.md` with a `sources:` header, sends unparseable or proof-less lines to `$RUN/unparsed.md`, and precomputes `$RUN/judge-plan.tsv` (2 non-author judges per finding).
+- **All roles in ONE pass.** `triage` rebuilds `findings/` from scratch every call, so it takes *every* role you want represented at once. With no role args it does `review`, plus `cross` when `$RUN/cross` exists. Never name roles one at a time — the second call would rebuild without the first round.
+- **Identity comes from the `<out>.author` sidecar** that `fan`/`cross-verify` write next to each artifact (for a cross-verify artifact the author is the *verifier*), not from the filename. So `sources:` holds full participant strings — `opencode:zai-coding-plan/glm-5.2`, not a slug — and author-exclusion compares whole strings, so `grok` is never confused with `grok-4.5`.
+- Location accepts `file:<n>` and `file:<n>-<m>` (a range's first number is the line).
+It prints `raw=… deduped=… unparsed=… judge-pairs=… under-judged=… candidates=… roles=…` — carry those numbers into the report's coverage block verbatim. `candidates=` is the size of the actual judge pool: `$FUSION_REVIEW_ROSTER` when set, otherwise the participants observed via the sidecars — so a hand-passed participant list still gets judges instead of an empty plan. `roles=` is last because it is the one free-form field. `under-judged>0` means there were fewer than 2 non-authors for some finding; those are `judged: <n>/2 (degraded)`.
 
 ### 4. Cross-verify — MISSED first (skip if `--depth lite`)
 Rotation (i verifies i+1, nobody grades themselves): `bash "$SH" cross-verify <verifier> $RUN/review/<author>.md $RUN`.
-The baked contract asks for **MISSED before FALSE-POSITIVE** on purpose: grading the author's list only polices false positives, while the expensive miss in review is the bug nobody saw. New findings from this round re-enter step 3 **once** — re-run `triage` with the cross round included (no unbounded loop).
+The baked contract asks for **MISSED before FALSE-POSITIVE** on purpose: grading the author's list only polices false positives, while the expensive miss in review is the bug nobody saw. New findings from this round re-enter step 3 **once** — re-run triage naming **both** roles in a single call, `bash "$SH" triage $RUN review cross` (no unbounded loop). One call, both roles: `triage review` followed by `triage cross` would rebuild `findings/` from the cross round alone and lose round 1 entirely.
 
 ### 5. Judge every finding (per-finding consensus)
 Execute `$RUN/judge-plan.tsv` — each row is `<finding-id>\t<participant>`, already filtered so no participant judges its own finding: `bash "$SH" judge <participant> $RUN/findings/<id>.md $RUN`. Run the rows in parallel; each prints its verdict. Verdicts are `real|refuted|uncertain`:
 - both `real` → **confirmed**; both `refuted` → **refuted**; anything else (incl. any `uncertain`) → **disputed**.
 - A `disputed` BLOCKER is worth one `bash "$SH" spike "reproduce <finding> and show the actual failure" $RUN <participant>` — a worktree repro settles it with evidence instead of opinion.
-- `triage` already flagged findings with fewer than 2 non-author judges; mark those `judged: 1/2 (degraded)`. Never top up with an author to reach two.
+- `triage` already flagged findings with fewer than 2 non-author judges; mark those `judged: <n>/2 (degraded)`. Never top up with an author to reach two.
+- **Co-discovered findings have no judges left, and that is not a degradation.** When a finding's `sources:` already list *every* available participant, the non-author pool is empty by construction — `triage` reports `0` judges for it. Do not top up with an author. Mark it `judged: co-discovered` and say in one sentence why that counts: independent discovery of the same `file:line` by every available family is corroboration from the same disjoint-blind-spots argument that judging rests on, and no author-run judge could add anything but an echo.
 
 ### 6. Report (`$RUN/report.md`)
 Three sections, severity-ordered inside each: **Confirmed** · **Disputed** (with what would settle it) · **Refuted** (collapsed one-liners — kept, so a rejected finding isn't re-raised next run).
@@ -76,7 +81,7 @@ Every entry: `file:line`, суть, пруф, `sources:`, `judged:`. Lead the re
 State the base ref and HEAD you reviewed — a report without its git stamp is unreproducible.
 
 ### 7. Learn
-Append a paragraph to review memory: which lens caught the highest-severity confirmed finding, which participant produced the most refuted findings (a noisy model is a roster decision), and any false-positive pattern worth adding to the contract. The next run's step 2 loads it.
+Append a paragraph to review memory: which lens axis carried the highest-severity confirmed finding (and whether any axis produced nothing across the whole roster — a dead axis is either a clean diff or a prompt that doesn't ask hard enough), which participant produced the most refuted findings (a noisy model is a roster decision), and any false-positive pattern worth adding to the contract. The next run's step 2 loads it.
 
 ## Degraded / failures
 - timeout/exit≠0/empty → retry `fan` **into a fresh run dir or a new role name**; a sealed round is immutable (exit 95) and re-running into it would report `ok:0, degraded:true` while good drafts sit intact — a harness failure wearing a model failure's face.

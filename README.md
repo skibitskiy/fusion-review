@@ -3,7 +3,7 @@
 [![CI](https://github.com/skibitskiy/fusion-review/actions/workflows/ci.yml/badge.svg)](https://github.com/skibitskiy/fusion-review/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Multi-model adversarial code review.** Every model you put in `$FUSION_REVIEW_ROSTER` — Claude, Codex, Grok, or anything you reach through [opencode](https://opencode.ai) (GLM, Kimi, DeepSeek, MiniMax…) — reviews **the same diff independently** under a different lens, then attacks the others' output: what did they *miss*, and which of their findings don't survive a refutation attempt. The output is a triaged findings report — fusion-review never touches your code.
+**Multi-model adversarial code review.** Every model you put in `$FUSION_REVIEW_ROSTER` — Claude, Codex, Grok, or anything you reach through [opencode](https://opencode.ai) (GLM, Kimi, DeepSeek, MiniMax…) — reviews **the same diff independently** against the same set of lens axes, then attacks the others' output: what did they *miss*, and which of their findings don't survive a refutation attempt. The output is a triaged findings report — fusion-review never touches your code.
 
 > **Status: v0.1, experimental.** Forked from [fusion](https://github.com/malakhov-dmitrii/fusion), whose harness (`fan` / `cross-verify` / `collect` / `cleanup`, the read-only sandboxing per CLI, the write-guard, the coverage discipline) this still is. The review playbook and the `judge` primitive are new and not yet battle-tested.
 
@@ -23,21 +23,23 @@ The second failure mode is the opposite one: models inventing plausible bugs. Th
 bundle  (diff + FULL text of changed files + callers of changed symbols)
    │       whole files, never bare hunks — a hunk that looks broken
    ▼       is usually guarded 20 lines above it
-fan ──► model A  (correctness/concurrency)     ┐  every model sees the WHOLE bundle;
-        model B  (security/untrusted-input)    │  the lens biases attention, it does
-        model C  (api-contract/compat)         │  not shard the work
-        model D  (tests/observability)         ┘  each ends with a REVIEWED: witness line
-   │
+fan ──► model A   ┐  ONE prompt file, sent verbatim to every participant. It names all the
+        model B   │  lens axes — correctness/concurrency · security/untrusted-input ·
+        model C   │  api-contract/compat · perf/resources · tests/observability — and each
+        model D   ┘  model covers all of them. Diversity comes from the FAMILIES differing,
+   │                 not the prompt: fan has no per-participant prompt. Every model sees the
+   │                 WHOLE bundle and ends with a REVIEWED: witness line.
    ▼
 triage               [SEV] axis file:line — суть — пруф   ← one command, no host judgement:
-   │                 clusters on (file, axis, line ±3), keeps the highest severity, preserves
-   │                 every raw wording, counts unparseable/proof-less lines instead of hiding
-   │                 them, and precomputes judge-plan.tsv (2 judges per finding, never authors)
+   │                 clusters on (file, axis, line within +3 of the cluster's first line), keeps
+   │                 the highest severity, preserves every participant's raw gist AND proof, counts
+   │                 unparseable/proof-less lines instead of hiding them, and precomputes
+   │                 judge-plan.tsv (2 judges per finding, never authors)
    ▼
 cross-verify  (rotation — nobody grades themselves)
    asks for MISSED first, FALSE-POSITIVE second
-   │
-   ▼
+   │                 new findings re-enter triage ONCE — naming BOTH rounds in one call
+   ▼                 (`triage runs/r1 review cross`), because triage rebuilds findings/ each time
 judge  (per finding: 2 participants that are NOT its authors, told to REFUTE)
    both real → confirmed · both refuted → refuted · anything else → disputed
    disputed BLOCKER → spike: reproduce it in a throwaway worktree
@@ -48,7 +50,7 @@ report.md   confirmed · disputed · refuted   + a coverage block with every den
 
 Three invariants make it trustworthy:
 - **Union, not consensus.** A single-model finding is marked `sources: 1`, never dropped.
-- **No self-confirmation.** A model never judges its own finding — that's an echo, not verification. `triage` computes the routing, so a host cannot get it wrong; both this and the dedupe are in the harness precisely because doing them by hand fails *invisibly*.
+- **No self-confirmation.** A model never judges its own finding — that's an echo, not verification. `triage` computes the routing, so a host cannot get it wrong; both this and the dedupe are in the harness precisely because doing them by hand fails *invisibly*. Identity is not guessed from a filename: `fan` and `cross-verify` write a `<artifact>.author` sidecar holding the participant string verbatim (for a cross-verify artifact, the *verifier*), and exclusion compares whole strings — so `grok` is never mistaken for `grok-4.5`, and a compound name like `grok-on-opencode_glm` is never read as one identity.
 - **Every number carries its denominator.** Not "found 5 bugs" but `5 confirmed / 23 raw · 4/4 participants ok · 12/12 files bundled · 3 unparsed`. A participant that returns nothing must prove it looked (`REVIEWED:` line) or it counts as an error, not as "clean".
 
 Write isolation is inherited from fusion: review is read-only, a git guard snapshots the repo before and after every fan, and a mutated tracked file stops the run (`write_leak: true`).
@@ -58,7 +60,11 @@ Write isolation is inherited from fusion: review is read-only, a git guard snaps
 ```bash
 git clone https://github.com/skibitskiy/fusion-review && cd fusion-review
 ./install.sh                 # detects Claude Code / Codex, links the skill
-# authenticate the providers in your roster (below), then:
+
+# set a roster — there is no default, and no fallback (unset => fan exits 96)
+export FUSION_REVIEW_ROSTER="grok opencode:zai-coding-plan/glm-5.2"
+
+# authenticate those providers (below), then:
 /fusion-review --dir <path-to-your-repo> --base main
 ```
 
@@ -119,12 +125,21 @@ Or drive the harness directly (no host needed):
 
 ```bash
 bash skills/fusion-review/review.sh fan review prompt.txt runs/r1   # roster from $FUSION_REVIEW_ROSTER
-bash skills/fusion-review/review.sh cross-verify codex runs/r1/review/codex.md runs/r1
 bash skills/fusion-review/review.sh triage runs/r1                  # -> findings/ + judge-plan.tsv
+bash skills/fusion-review/review.sh cross-verify codex runs/r1/review/codex.md runs/r1
+bash skills/fusion-review/review.sh triage runs/r1 review cross     # re-triage: BOTH rounds, one call
 bash skills/fusion-review/review.sh judge grok runs/r1/findings/007.md runs/r1
 bash skills/fusion-review/review.sh collect runs/r1
 bash skills/fusion-review/review.sh --help
 ```
+
+`triage` takes **any number of roles in one pass** and rebuilds `findings/` from all of them (no args ⇒ `review`, plus `cross` if that round exists). Naming roles one at a time would drop the rounds you didn't name. It ends with a single summary line:
+
+```
+triage: raw=23 deduped=14 unparsed=3 judge-pairs=26 under-judged=1 candidates=3 roles=review cross
+```
+
+Every one of those is a denominator worth copying into the report verbatim. `candidates=` is the judge pool actually used — `$FUSION_REVIEW_ROSTER` when it's set, otherwise the participants observed via the `.author` sidecars, so passing a participant list by hand still yields judges instead of an empty plan. `roles=` sits last because it's the only free-form field, which keeps every counter ahead of it trivially parseable.
 
 Artifacts land **outside** the reviewed repo, in `~/.fusion-review/runs/<repo>-<timestamp>/`. That's deliberate: reviewers run with live read-access to the repo, so in-tree artifacts would let one participant read another's review and turn an echo into fake corroboration.
 
