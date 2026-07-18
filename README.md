@@ -136,10 +136,17 @@ bash skills/fusion-review/review.sh --help
 `triage` takes **any number of roles in one pass** and rebuilds `findings/` from all of them (no args ⇒ `review`, plus `cross` if that round exists). Naming roles one at a time would drop the rounds you didn't name. It ends with a single summary line:
 
 ```
-triage: raw=23 deduped=14 unparsed=3 judge-pairs=26 under-judged=1 candidates=3 roles=review cross
+triage: raw=23 deduped=14 unparsed=3 judge-pairs=26 under-judged=1 co-discovered=2 candidates=3 excluded=1 roles=review cross
 ```
 
-Every one of those is a denominator worth copying into the report verbatim. `candidates=` is the judge pool actually used — `$FUSION_REVIEW_ROSTER` when it's set, otherwise the participants observed via the `.author` sidecars, so passing a participant list by hand still yields judges instead of an empty plan. `roles=` sits last because it's the only free-form field, which keeps every counter ahead of it trivially parseable.
+Every one of those is a denominator worth copying into the report verbatim. `candidates=` is the judge pool actually used — `$FUSION_REVIEW_ROSTER` when it's set, otherwise the participants observed via the `.author` sidecars, so passing a participant list by hand still yields judges instead of an empty plan. `excluded=` is how many of those were dropped because `status.json` records them as not `ok` this round (they're named on stderr too): a model that timed out during `fan` can't judge that run, and assigning it anyway just produces more timeouts. `roles=` sits last because it's the only free-form field, which keeps every counter ahead of it trivially parseable.
+
+`under-judged=` and `co-discovered=` are deliberately **separate counters for opposite situations**, because one number reported both and made the good case indistinguishable from the bad one. `under-judged=` means the roster was too small to find two non-authors — a real degradation. `co-discovered=` means the finding's `sources:` already cover every candidate: every available family found it independently, so there is nobody left who *could* judge it without grading their own work. That's the ensemble working, not failing; `triage` labels those findings `judged: co-discovered` in the finding file itself.
+
+Two guardrails are enforced mechanically rather than by convention:
+
+- **`triage` refuses to guess an identity (exit 93).** Every artifact must have its `.author` sidecar. Filenames are lossy slugs — and a cross artifact's filename fuses *two* participants — so deriving a participant from one silently re-opens self-judging.
+- **`judge` refuses to grade its own finding (exit 92).** It reads the finding's `sources:` before doing anything else, so the no-self-judging invariant no longer depends on the host executing `judge-plan.tsv` faithfully.
 
 Artifacts land **outside** the reviewed repo, in `~/.fusion-review/runs/<repo>-<timestamp>/`. That's deliberate: reviewers run with live read-access to the repo, so in-tree artifacts would let one participant read another's review and turn an echo into fake corroboration.
 

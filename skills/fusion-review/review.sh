@@ -43,6 +43,7 @@ _count() { local n; n="$(grep -c . "$1" 2>/dev/null)"; [ -n "$n" ] || n=0; print
 # not match `grok-4.5`, and `claude` must not match `claude:opus`.
 _is_source() {
   local cand="$1" rest="$2" item
+  [ -n "$cand" ] || return 1
   while [ -n "$rest" ]; do
     case "$rest" in
       *", "*) item="${rest%%, *}"; rest="${rest#*, }" ;;
@@ -166,12 +167,20 @@ cmd_fan() {
   # Δ2 seal-before-share: the instant the round ends, freeze each draft (read-only + a shasum
   # manifest) BEFORE any later stage can show it to another participant — a tamper-evident
   # record that no draft was revised after glimpsing a sibling's.
+  # The seal must cover IDENTITY, not just prose. Once triage stopped guessing a participant from
+  # the filename, the `.author` sidecar became the only thing that says who wrote a draft — and a
+  # manifest that hashes only the `.md` would let a sidecar be rewritten after sealing without
+  # breaking a single checksum. Re-attributing a finding is a strictly worse tamper than editing
+  # it: it silently re-opens author-exclusion. Sidecars are sealed with the drafts they name.
   : >"$dir/$role/SEALED.manifest"
+  local art
   for p in "$@"; do
     slug="$(_slug "$p")"
-    [ -f "$dir/$role/$slug.md" ] || continue
-    shasum "$dir/$role/$slug.md" >>"$dir/$role/SEALED.manifest" 2>/dev/null || true
-    chmod a-w "$dir/$role/$slug.md" 2>/dev/null || true
+    for art in "$dir/$role/$slug.md" "$dir/$role/$slug.author"; do
+      [ -f "$art" ] || continue
+      shasum "$art" >>"$dir/$role/SEALED.manifest" 2>/dev/null || true
+      chmod a-w "$art" 2>/dev/null || true
+    done
   done
   sig_after="$(_repo_sig)"
   if [ "$sig_before" != "$sig_after" ]; then
@@ -232,6 +241,21 @@ cmd_cross_verify() {
 # uncertain findings get laundered into `real` or silently dropped, and in review both are bad.
 cmd_judge() {
   local participant="$1" target="$2" dir="$3"
+  # Author-exclusion ENFORCED AT THE POINT OF USE. triage precomputes judge-plan.tsv with the
+  # authors already filtered out, but nothing made the host execute that plan: `judge <anyone>
+  # <any finding>` was accepted, so the no-self-judging invariant held only as long as the host
+  # transcribed the plan correctly. A guarantee that depends on the caller obeying a file is
+  # advisory. The finding carries its own `sources:` header — check it here, and refuse.
+  local srcs=""
+  [ -f "$target" ] && srcs="$(awk -F'sources: ' '/^sources: /{print $2; exit}' "$target")"
+  if [ -n "$srcs" ] && _is_source "$participant" "$srcs"; then
+    echo "judge: REFUSED — '$participant' is a source of $(basename "$target") (sources: $srcs)." >&2
+    echo "       A model grading its own finding confirms it; that is an echo, not verification." >&2
+    echo "       Use a participant from \$RUN/judge-plan.tsv for this finding." >&2
+    return 92
+  fi
+  # Preflight AFTER the refusal: routing is a policy question, not a harness one. Refusing a
+  # self-judge must not depend on timeout(1) being installed.
   _preflight || return 127
   mkdir -p "$dir/judge"
   local pslug; pslug="$(_slug "$participant")"
@@ -330,7 +354,7 @@ cmd_selftest() {
   echo "FAIL — $participant: exit $ex, ${bytes} bytes"; return 1
 }
 
-# triage <dir> [role] — parse the reviews in <dir>/<role>/, dedupe findings, and emit
+# triage <dir> [role...] — parse the reviews in <dir>/<role>/, dedupe findings, and emit
 #   findings/<nnn>.md · judge-plan.tsv · unparsed.md  + a one-line summary with every denominator.
 #
 # This lives in the harness rather than the playbook ON PURPOSE. Two of its steps fail SILENTLY when
@@ -347,7 +371,14 @@ cmd_triage() {
   # review round's findings and left only cross's. Clearing findings/ is still correct — but only
   # because one pass now rebuilds from every named role, so no round can be lost by naming them
   # one at a time.
-  local roles="$*" r
+  local roles="" r
+  # DEDUPE the role list. `triage $d review review` walked the same directory twice and counted
+  # every finding twice — raw doubled, and each finding listed its author once (the src[] dedupe
+  # hid it), so the inflated denominator was invisible in the findings themselves.
+  for r in "$@"; do
+    case " $roles " in *" $r "*) continue ;; esac
+    roles="$roles${roles:+ }$r"
+  done
   if [ -z "$roles" ]; then
     roles="review"
     [ -d "$dir/cross" ] && roles="review cross"
@@ -355,17 +386,43 @@ cmd_triage() {
   for r in $roles; do
     [ -d "$dir/$r" ] || { echo "triage: no round dir $dir/$r" >&2; return 94; }
   done
+  # Validate identity BEFORE touching anything. triage rebuilds findings/ from scratch, so bailing
+  # out mid-parse would destroy the previous triage's output on the way to failing — punishing the
+  # user twice for one stale artifact. Check every sidecar first, then mutate.
+  local vf
+  for r in $roles; do
+    for vf in "$dir/$r"/*.md; do
+      [ -f "$vf" ] || continue
+      [ -s "${vf%.md}.author" ] && continue
+      echo "triage: no identity sidecar for $vf (expected ${vf%.md}.author)." >&2
+      echo "        A filename is not an identity — deriving one re-opens self-judging." >&2
+      echo "        Re-run \`fan\`/\`cross-verify\` to produce the artifact with its sidecar." >&2
+      return 93
+    done
+  done
+
   local raw="$dir/findings.tsv" un="$dir/unparsed.md" fdir="$dir/findings"
   rm -rf "$fdir"; mkdir -p "$fdir"; : >"$raw"; : >"$un"
   local f p observed=""
   for r in $roles; do
     for f in "$dir/$r"/*.md; do
       [ -f "$f" ] || continue
-      # Identity comes from the sidecar written by fan/cross-verify; the basename is only a
-      # fallback for artifacts produced before sidecars existed.
+      # Identity comes from the sidecar written by fan/cross-verify. There is NO basename fallback,
+      # and that is the whole point: a basename is a _slug output — lossy, one-way, and for a
+      # cross-verify artifact ('grok-on-claude_opus.md') a COMPOUND of two participants. Falling
+      # back to it produced `sources: grok-on-claude_opus`, which matches no roster entry, so
+      # author-exclusion excluded nobody and the judge plan handed the finding to BOTH grok and
+      # claude:opus — the author judging itself, exactly the bug sidecars were added to kill.
+      # fan and cross-verify always write a sidecar, so a missing one means a stale or hand-made
+      # artifact. Guessing an identity is what produced the bug; refuse instead.
       p=""
       [ -f "${f%.md}.author" ] && p="$(cat "${f%.md}.author" 2>/dev/null)"
-      [ -n "$p" ] || p="$(basename "$f" .md)"
+      if [ -z "$p" ]; then
+        echo "triage: no identity sidecar for $f (expected ${f%.md}.author)." >&2
+        echo "        A filename is not an identity — deriving one re-opens self-judging." >&2
+        echo "        Re-run \`fan\`/\`cross-verify\` to produce the artifact with its sidecar." >&2
+        return 93
+      fi
       case " $observed " in *" $p "*) ;; *) observed="$observed${observed:+ }$p" ;; esac
       # A finding is `[SEV] axis file:line — gist — proof`. A line missing the location or the proof
       # is NOT downgraded into a vague finding — it goes to unparsed.md and stays in the denominator.
@@ -373,13 +430,28 @@ cmd_triage() {
         function trim(x){ sub(/^[ \t]+/,"",x); sub(/[ \t]+$/,"",x); return x }
         {
           line=$0
-          # Strip leading whitespace FIRST, then an optional bullet, then any space after it.
-          # The old order stripped only a bullet, so an indented finding failed the ^\[ test and
-          # hit `next` — vanishing from findings AND from unparsed, i.e. from both denominators.
-          # A tool whose headline claim is its denominators cannot silently drop lines.
+          # UNDECORATE before the shape test. Round 1 handled leading whitespace and -/* bullets
+          # only, but models emit markdown: a bold, numbered or blockquoted finding failed the
+          # ^\[ test and hit `next`, vanishing from findings AND from unparsed — from BOTH
+          # denominators. A tool whose headline claim is its denominators cannot silently drop
+          # lines, so every decoration a model might wrap a finding in is peeled off first.
           sub(/^[ \t]+/,"",line)
-          sub(/^[-*][ \t]*/,"",line)
+          while (sub(/^>[ \t]*/,"",line)) { }          # blockquote, possibly nested: "> > "
+          sub(/^([-+]|[0-9]+[.)])[ \t]+/,"",line)      # list marker: "- ", "+ ", "1. ", "1) "
           sub(/^[ \t]+/,"",line)
+          # Emphasis runs: **bold**, __bold__, *ital*, _ital_. This also absorbs a "* " bullet (a
+          # lone leading asterisk), which is why the bullet rule above deliberately does not claim
+          # "*" — "**[MAJOR]" must peel as emphasis, not as a bullet plus emphasis.
+          # The TRAILING strip is conditional on a LEADING one because markdown emphasis is PAIRED.
+          # Stripping it unconditionally would corrupt the proof of any undecorated finding whose
+          # last token legitimately ends in an emphasis char — "…— proof: caller passes buf_" would
+          # silently lose the underscore, changing the identifier the proof names. Undecorated
+          # findings are the common case, so that trade is not close.
+          if (sub(/^[*_]+/,"",line)) {
+            sub(/[ \t]*[*_]+[ \t]*$/,"",line)
+          }
+          sub(/^[ \t]+/,"",line)
+          sub(/[ \t]+$/,"",line)
           # "finding-shaped" = starts with a severity tag. Shaped-but-broken MUST reach unparsed.md;
           # prose is skipped silently and counted nowhere (inflating unparsed with prose would make
           # the number useless as a parse-failure signal).
@@ -446,8 +518,44 @@ cmd_triage() {
   local candidates; candidates="$(_roster)"
   [ -n "$candidates" ] || candidates="$observed"
 
+  # A participant that FAILED this round cannot judge it. Observed in the real round-2 run:
+  # opencode:zai-coding-plan/glm-5.2 timed out during `fan`, yet it was still in the roster, so
+  # triage assigned it as judge in 10 of 16 pairs — and every one of those judgements timed out
+  # too. The roster is the CONFIGURED ensemble; status.json is who actually answered. Judge
+  # routing needs the second. Only an explicit non-`ok` status excludes: a participant absent
+  # from status.json is unknown, not failed, and unknown must not shrink the pool.
+  local failed="" excluded="" c n_excl=0
+  if [ -f "$dir/status.json" ]; then
+    failed="$(awk '{
+      s=$0
+      while (match(s, /"[^"]+":\{"exit":[0-9]+,"status":"[a-z]+"\}/)) {
+        e=substr(s,RSTART,RLENGTH); s=substr(s,RSTART+RLENGTH)
+        name=substr(e,2); sub(/":\{.*$/,"",name)
+        st=e; sub(/^.*"status":"/,"",st); sub(/"\}$/,"",st)
+        if (st!="ok") print name
+      }
+    }' "$dir/status.json" 2>/dev/null | tr '\n' ' ')"
+  fi
+  if [ -n "$failed" ]; then
+    local kept="" failed_csv
+    # _is_source expects the ", "-joined form its callers use for `sources:` headers.
+    failed_csv="$(printf '%s' "$failed" | sed 's/ *$//; s/  */, /g')"
+    for c in $candidates; do
+      if _is_source "$c" "$failed_csv"; then
+        excluded="$excluded${excluded:+ }$c"; n_excl=$((n_excl+1))
+      else
+        kept="$kept${kept:+ }$c"
+      fi
+    done
+    candidates="$kept"
+    # Never a silent shrink: a smaller pool changes what `under-judged` means, so name the
+    # participants that left and why, right where the counters are read.
+    [ -n "$excluded" ] && echo "triage: excluded from the judge pool (not ok in status.json): $excluded" >&2
+  fi
+
   # Judge routing: 2 participants per finding, NEVER one of its sources (see the header comment).
-  local fn id srcs c chosen short=0
+  local fn id srcs chosen short=0 codisc=0 n_cand
+  n_cand="$(printf '%s' "$candidates" | wc -w | tr -d ' ')"
   : >"$dir/judge-plan.tsv"
   for fn in "$fdir"/*.md; do
     [ -f "$fn" ] || continue
@@ -463,7 +571,28 @@ cmd_triage() {
       printf '%s\t%s\n' "$id" "$c" >>"$dir/judge-plan.tsv"
       chosen=$((chosen+1)); [ "$chosen" -ge 2 ] && break
     done
-    [ "$chosen" -lt 2 ] && { short=$((short+1)); echo "triage: finding $id has only $chosen non-author judge(s) — mark it judged: $chosen/2 (degraded)" >&2; }
+    # CO-DISCOVERED is not under-judged. `chosen==0` with a non-empty pool means every candidate
+    # is already a source: every available family found this independently. That is the ensemble's
+    # BEST case, and round 1 reported it identically to "the roster is too small to find two
+    # judges" — the worst case. SKILL.md's `judged: co-discovered` rule was therefore unenforceable
+    # by the host, which had only one number for two opposite situations. Make it mechanical:
+    # label the finding, count it separately, and keep `under-judged=` meaning only "roster too
+    # small". An empty pool is NOT co-discovery — nobody discovered anything twice, there is
+    # simply nobody left to ask. Neither is a pool of ONE: "every available family found this"
+    # is corroboration only when there was more than one family to agree. A single-participant
+    # pool trivially satisfies "sources cover every candidate" while nobody corroborated
+    # anything — labelling that co-discovered would misreport a degenerate roster as the
+    # ensemble's best case, which is the same class of lie this item exists to remove. n_cand<2
+    # is the roster being too small, i.e. under-judged.
+    if [ "$chosen" -eq 0 ] && [ "$n_cand" -ge 2 ]; then
+      codisc=$((codisc+1))
+      awk '{print} /^sources: /&&!d{print "judged: co-discovered"; d=1}' "$fn" >"$fn.tmp" \
+        && mv "$fn.tmp" "$fn"
+      echo "triage: finding $id is co-discovered by every candidate — mark it judged: co-discovered" >&2
+    elif [ "$chosen" -lt 2 ]; then
+      short=$((short+1))
+      echo "triage: finding $id has only $chosen non-author judge(s) — mark it judged: $chosen/2 (degraded)" >&2
+    fi
   done
 
   local n_raw n_find n_un n_pair
@@ -473,7 +602,7 @@ cmd_triage() {
   n_pair="$(_count "$dir/judge-plan.tsv")"
   # roles= stays LAST: it is the only free-form field (it can hold several space-separated roles),
   # so every key=value counter ahead of it remains trivially parseable.
-  echo "triage: raw=$n_raw deduped=$n_find unparsed=$n_un judge-pairs=$n_pair under-judged=$short candidates=$(printf '%s' "$candidates" | wc -w | tr -d ' ') roles=$roles"
+  echo "triage: raw=$n_raw deduped=$n_find unparsed=$n_un judge-pairs=$n_pair under-judged=$short co-discovered=$codisc candidates=$n_cand excluded=$n_excl roles=$roles"
 }
 
 _usage() {
@@ -485,7 +614,9 @@ review.sh — minimal multi-model fan-out harness for code review
   cross-verify <verifier> <target-review> <dir> [pf]  idiot-test one review (missed + false-positive)
   triage <dir> [role...]                              parse+dedupe reviews -> findings/ + judge-plan.tsv
                                                       (all roles in ONE pass; default: review [+ cross])
+                                                      exit 93 = an artifact has no .author sidecar
   judge <participant> <finding-file> <dir>            adversarially refute ONE finding; prints VERDICT
+                                                      exit 92 = refused: participant authored it
   spike <hypothesis> <dir> [participant]              reproduce a finding in a throwaway worktree
   collect <dir>                                       concat run artifacts into aggregate.md
   selftest [participant]                              smoke the harness; PASS/FAIL
