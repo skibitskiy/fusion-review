@@ -10,8 +10,8 @@ labels: bug
 **Expected**
 
 **Roster & hosts**
-- Roster (`FUSION_ROSTER`):
-- Host (Claude Code / Codex / direct `fusion.sh`):
+- Roster (`FUSION_REVIEW_ROSTER`):
+- Host (Claude Code / Codex / direct `review.sh`):
 - CLIs: `claude --version` / `codex --version` / `opencode --version`
 
 **Environment**
